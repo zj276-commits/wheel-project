@@ -161,12 +161,26 @@ function option_greeks(S::Float64, K::Float64, T::Float64, r::Float64, σ::Float
 end
 
 # ── Strike from Delta (Bisection) ────────────────────────────────────────────
+# ⚠ SELF-DESIGNED — no direct course or textbook reference.
+# This bridges strategy parameters (delta targets) to option pricing.
+#
+# How it works (plain English):
+#   Input:  "I want to sell a put with |Δ| = 0.25"
+#   Output: "Set the strike at $220" (for a $230 stock)
+#
+#   Method: binary search over K ∈ [0.5×S, 2.0×S].
+#   At each midpoint, compute CRR delta.
+#   If |Δ| is too high → K is too close to S (too ITM) → search lower K.
+#   If |Δ| is too low  → K is too far from S (too OTM) → search higher K.
+#   Converge when K_hi - K_lo < $0.005.
 
 """
     strike_from_delta(S, T, r, σ, target_delta, option_type; N=30, q=0.0) -> Float64
 
+⚠ SELF-DESIGNED (no course reference).
 Find the strike K that produces a target |delta| under CRR American pricing.
-Self-designed bisection (no direct course reference).
+Uses bisection search: try K from 0.5×S to 2.0×S, compute CRR delta at each
+midpoint, and converge to the K where |Δ(K)| ≈ target_delta.
 """
 function strike_from_delta(S::Float64, T::Float64, r::Float64, σ::Float64,
                            target_delta::Float64, option_type::Symbol;
@@ -201,14 +215,26 @@ function strike_from_delta(S::Float64, T::Float64, r::Float64, σ::Float64,
 end
 
 # ── Implied Volatility Estimation ─────────────────────────────────────────────
+# ⚠ SELF-DESIGNED — CRR-based IV solver for American options.
+# VLQuantitativeFinancePackage has estimate_implied_volatility() for European;
+# this version handles American early exercise via CRR.
+#
+# How it works (plain English):
+#   Input:  "This put is trading at $3.50 in the market"
+#   Output: "The market-implied volatility is σ = 0.32 (32%)"
+#
+#   Method: binary search over σ ∈ [0.01, 3.0].
+#   At each midpoint, price the option via CRR.
+#   If CRR price > market price → σ is too high → search lower σ.
+#   If CRR price < market price → σ is too low  → search higher σ.
+#   Converge when σ_hi - σ_lo < 1e-6.
 
 """
     estimate_implied_vol(S, K, T, r, market_price, option_type; q=0.0, N=50) -> Float64
 
-Estimate implied volatility by bisection on CRR price.
+⚠ SELF-DESIGNED (CRR-based alternative to BSM IV solver).
+Estimate implied volatility by bisection on CRR American option price.
 Motivated by Varner PDF Section 7B: "calibrated to each name's IV surface."
-Course reference: VLQuantitativeFinancePackage provides estimate_implied_volatility().
-This is a self-designed CRR-based alternative for American options.
 """
 function estimate_implied_vol(S::Float64, K::Float64, T::Float64, r::Float64,
                                market_price::Float64, option_type::Symbol;

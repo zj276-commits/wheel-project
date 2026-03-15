@@ -1,194 +1,192 @@
-# Part 3: Portfolio Construction — Universe Definition for the Wheel ETF
+# Wheel Strategy Code — Live Trading Template
 #
-# Implements Portfolio Construction per Wheel-Fund-draft-Varner.pdf:
-#   Universe: Safe (low vol, high div, OI) + Aggressive (high vol, deep options)
-#   Weights:  60/40 Safe/Aggressive; ≤ 5% NAV per name
-#   Options:  tenor τ ∈ {7, 14, 30}; δP ∈ [0.20, 0.35]; δC ∈ [0.25, 0.40]
-#   Roll:     time-based (3–5 DTE)
-#   Liquidity: min OI/ADV, max bid-ask spread
+# This file is designed for REAL-TIME daily operations of the Wheel Strategy.
+# It connects to the same engine used in Backtest.jl but operates in "live" mode:
+#   1. Download today's prices
+#   2. Load existing portfolio state (or initialize new)
+#   3. Generate today's trading signals
+#   4. Output actionable trade recommendations
+#
+# Usage: Run daily before market open to get the day's trading plan.
+#
+# NOTE: This is a TEMPLATE — it shows the structure for live operations.
+# For actual trading, you would integrate with a broker API (e.g., Interactive Brokers).
 
 include(joinpath(@__DIR__, "Include.jl"));
 
-# SECTION 1: Load Volatility Data
-# SAGBM parameters precomputed from 2014–2024 historical data (drift + volatility).
-sagbm_df = load_sagbm_parameters();
-
-has_market_data = isfile(joinpath(_PATH_TO_DATA, "SP500-Daily-OHLC-1-3-2025-to-11-18-2025.jld2"));
-if has_market_data
-    original_dataset = MyTestingMarketDataSet() |> x -> x["dataset"];
-    maximum_number_trading_days = original_dataset["NVDL"] |> nrow;
-    dataset = let
-        d = Dict{String, DataFrame}();
-        for (ticker, data) ∈ original_dataset
-            nrow(data) == maximum_number_trading_days && (d[ticker] = data)
-        end; d
-    end;
-    list_of_tickers = keys(dataset) |> collect |> sort;
-    growth_rate_array = log_growth_matrix(dataset, list_of_tickers,
-        Δt = 1/252, risk_free_rate = 0.0);
-    vols = std(growth_rate_array, dims=1) |> vec;
-    vol_df = DataFrame(ticker = list_of_tickers, volatility = vols);
-else
-    @warn "JLD2 market data not found — using SAGBM precomputed volatility."
-    vol_df = select(sagbm_df, :ticker, :volatility);
-end
-
-# SECTION 2: Load Dividend Yield from Finviz
-finviz_df = load_finviz_screener();
-div_lookup = Dict(row.Ticker => row.div_yield for row in eachrow(finviz_df));
-mktcap_lookup = Dict{String, Float64}();
-volume_lookup = Dict{String, Float64}();
-for row in eachrow(finviz_df)
-    mc = row[Symbol("Market Cap")]; vol = row[:Volume]
-    mktcap_lookup[row.Ticker] = (mc isa Number && !ismissing(mc)) ? Float64(mc) : 0.0
-    volume_lookup[row.Ticker] = (vol isa Number && !ismissing(vol)) ? Float64(vol) : 0.0
-end
-
-# SECTION 3: Merge Volatility + Dividend Data
-divs = [get(div_lookup, t, 0.0) for t in vol_df.ticker];
-df_analysis = DataFrame(ticker = vol_df.ticker, vol = vol_df.volatility, div = divs);
-
-# SECTION 4: Classification Thresholds
-vol_low_threshold  = quantile(df_analysis.vol, 0.20);
-vol_high_threshold = quantile(df_analysis.vol, 0.80);
-div_payers = filter(row -> row.div > 0.0, df_analysis);
-div_median = nrow(div_payers) > 0 ? median(div_payers.div) : 3.0;
-
-println("Classification Thresholds:")
-println("  Vol P20: $(round(vol_low_threshold, digits=4))")
-println("  Vol P80: $(round(vol_high_threshold, digits=4))")
-println("  Div median: $(round(div_median, digits=2))%\n")
-
-# SECTION 5: Select 35 Companies — 25 Safe + 10 Aggressive
-# All S&P 500 tickers (present in SAGBM parameter set).
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: UNIVERSE (same as Backtest.jl)
+# ══════════════════════════════════════════════════════════════════════════════
 
 safe_tickers = [
-    "PEP",    # PepsiCo — Consumer Staples, ~3.7% div
-    "KO",     # Coca-Cola — Consumer Staples, ~3.0% div
-    "PG",     # Procter & Gamble — Consumer Staples, ~2.5% div
-    "JNJ",    # Johnson & Johnson — Healthcare, ~3.2% div
-    "CME",    # CME Group — Financials, ~3.6% div
-    "CMCSA",  # Comcast — Communication, ~3.9% div
-    "VZ",     # Verizon — Communication, ~6.5% div
-    "T",      # AT&T — Communication, ~5.0% div
-    "IBM",    # IBM — Technology, ~3.0% div
-    "MO",     # Altria — Consumer Staples, ~8.0% div
-    "PM",     # Philip Morris — Consumer Staples, ~4.5% div
-    "MDLZ",   # Mondelez — Consumer Staples, ~3.5% div
-    "EXC",    # Exelon — Utilities, ~3.4% div
-    "KMB",    # Kimberly-Clark — Consumer Staples, ~5.0% div
-    "PAYX",   # Paychex — Industrials, ~4.4% div
-    "TROW",   # T. Rowe Price — Financials, ~5.7% div
-    "PFG",    # Principal Financial — Financials, ~3.6% div
-    "SO",     # Southern Company — Utilities, ~3.5% div
-    "DUK",    # Duke Energy — Utilities, ~3.8% div
-    "ED",     # Consolidated Edison — Utilities, ~3.5% div
-    "LNT",    # Alliant Energy — Utilities, ~3.0% div
-    "GIS",    # General Mills — Consumer Staples, ~3.5% div
-    "CAG",    # Conagra Brands — Consumer Staples, ~5.0% div
-    "REG",    # Regency Centers — Real Estate, ~3.8% div
-    "CPB",    # Campbell Soup — Consumer Staples, ~6.2% div
+    "PEP", "KO", "PG", "JNJ", "CME", "CMCSA", "VZ", "T", "IBM",
+    "MO", "PM", "MDLZ", "EXC", "KMB", "PAYX", "TROW", "PFG",
+    "SO", "DUK", "ED", "LNT", "GIS", "CAG", "REG", "CPB",
 ];
 
-# Aggressive sleeve (Varner PDF §3): top-quintile volatility and deep options markets.
-# PDF explicitly names NVDA, AMD, TSLA as examples. Selected 10 names for best balance
-# of premium generation, options liquidity, and sector diversity.
 aggressive_tickers = [
-    "TSLA",   # Tesla — Consumer Discretionary, σ=0.49 (PDF-named)
-    "NVDA",   # NVIDIA — Technology, σ=0.39 (PDF-named)
-    "AMD",    # AMD — Technology, σ=0.47 (PDF-named)
-    "AAPL",   # Apple — Technology, deepest options market globally
-    "MSFT",   # Microsoft — Technology, deepest options market globally
-    "AMZN",   # Amazon — Consumer Discretionary, deep options market
-    "GOOG",   # Alphabet — Communication, σ=0.31
-    "META",   # Meta Platforms — Communication, σ~0.30
-    "NFLX",   # Netflix — Communication, σ=0.36
-    "DVN",    # Devon Energy — Energy, σ=0.46 (sector diversity)
+    "TSLA", "NVDA", "AMD", "AAPL", "MSFT", "AMZN",
+    "GOOG", "META", "NFLX", "DVN",
 ];
 
 all_tickers = vcat(safe_tickers, aggressive_tickers);
-@assert length(all_tickers) == 35
-@assert length(safe_tickers) >= 25
-@assert length(aggressive_tickers) >= 10
+sleeves = vcat(fill("Safe", length(safe_tickers)), fill("Aggressive", length(aggressive_tickers)));
+n_safe = length(safe_tickers)
+n_aggr = length(aggressive_tickers)
+weights = vcat(fill(0.60/n_safe, n_safe), fill(0.40/n_aggr, n_aggr));
 
-universe_df = DataFrame(
-    ticker  = all_tickers,
-    sleeve  = vcat(fill("Safe", length(safe_tickers)), fill("Aggressive", length(aggressive_tickers))),
-    div_yield = [get(div_lookup, t, 0.0) for t in all_tickers],
-    mkt_cap   = [get(mktcap_lookup, t, NaN) for t in all_tickers],
-    adv       = [get(volume_lookup, t, NaN) for t in all_tickers],
-);
-sagbm_vol_lookup = Dict(row.ticker => row.volatility for row in eachrow(sagbm_df));
-universe_df[!, :sagbm_vol] = [get(sagbm_vol_lookup, t, NaN) for t in all_tickers];
+sector_map = Dict{String, String}(
+    "PEP" => "Consumer Staples", "KO" => "Consumer Staples", "PG" => "Consumer Staples",
+    "MO" => "Consumer Staples", "PM" => "Consumer Staples", "MDLZ" => "Consumer Staples",
+    "KMB" => "Consumer Staples", "GIS" => "Consumer Staples", "CAG" => "Consumer Staples",
+    "CPB" => "Consumer Staples",
+    "JNJ" => "Health Care",
+    "CME" => "Financials", "TROW" => "Financials", "PFG" => "Financials",
+    "CMCSA" => "Communication", "VZ" => "Communication", "T" => "Communication",
+    "GOOG" => "Communication", "META" => "Communication", "NFLX" => "Communication",
+    "IBM" => "Technology", "AAPL" => "Technology", "MSFT" => "Technology",
+    "NVDA" => "Technology", "AMD" => "Technology",
+    "AMZN" => "Consumer Discretionary", "TSLA" => "Consumer Discretionary",
+    "EXC" => "Utilities", "SO" => "Utilities", "DUK" => "Utilities",
+    "ED" => "Utilities", "LNT" => "Utilities",
+    "PAYX" => "Industrials", "REG" => "Real Estate", "DVN" => "Energy",
+)
 
-println("Selected Universe: $(nrow(universe_df)) names")
-println("  Safe: $(count(universe_df.sleeve .== "Safe"))  Aggressive: $(count(universe_df.sleeve .== "Aggressive"))\n")
-pretty_table(universe_df, column_labels = ["Ticker", "Sleeve", "Div Yield (%)", "Mkt Cap (M)", "ADV", "SAGBM Vol"]);
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: LOAD TODAY'S DATA
+# ══════════════════════════════════════════════════════════════════════════════
 
-# SECTION 6: Portfolio Weights — 60/40 Safe/Aggressive
-total_nav     = 600_000_000.0;   # $600M initial AUM
-safe_alloc    = 0.60;
-aggr_alloc    = 0.40;
-max_per_name  = 0.05;
+today = Dates.today()
+lookback_start = today - Day(90)
 
-n_safe = length(safe_tickers);
-n_aggr = length(aggressive_tickers);
-safe_weight_per_name = safe_alloc / n_safe;
-aggr_weight_per_name = aggr_alloc / n_aggr;
+println("══════════════════════════════════════════════════════")
+println("   Wheel Strategy — Daily Trading Signals")
+println("   Date: $(today)")
+println("══════════════════════════════════════════════════════\n")
 
-@assert safe_weight_per_name ≤ max_per_name
-@assert aggr_weight_per_name ≤ max_per_name
+sagbm_df = load_sagbm_parameters();
+vol_map = Dict{String, Float64}()
+for row in eachrow(sagbm_df)
+    vol_map[row.ticker] = row.volatility
+end
 
-universe_df[!, :weight] = vcat(fill(safe_weight_per_name, n_safe), fill(aggr_weight_per_name, n_aggr));
-universe_df[!, :notional] = universe_df.weight .* total_nav;
+println("  Loading price data ($(lookback_start) → $(today))...")
+price_data = download_all_prices(all_tickers, lookback_start, today);
+div_data = download_all_dividends(all_tickers, lookback_start, today);
 
-shares_per_name = 200;
-block_a_shares  = 100;
-block_b_shares  = 100;
+rolling_vol = compute_rolling_volatility(price_data; window=30);
+div_yields = compute_dividend_yields(div_data, price_data);
 
-println("\nPortfolio Weights:")
-println("  NAV: \$$(Int(total_nav))   Safe 60%: \$$(Int(total_nav*safe_alloc))   Aggr 40%: \$$(Int(total_nav*aggr_alloc))")
-println("  Safe per-name: $(round(safe_weight_per_name*100, digits=2))%   Aggr per-name: $(round(aggr_weight_per_name*100, digits=2))%")
-println("  Shares/name: $shares_per_name ($(block_a_shares) hold + $(block_b_shares) wheel)\n")
+sleeves_map = Dict(all_tickers[i] => sleeves[i] for i in 1:length(all_tickers))
+rolling_iv = compute_rolling_iv(rolling_vol, sleeves_map);
 
-# SECTION 7: Sector Diversification
-sector_map = Dict(
-    "PEP"=>"Consumer Staples", "KO"=>"Consumer Staples", "PG"=>"Consumer Staples",
-    "JNJ"=>"Healthcare", "CME"=>"Financials", "CMCSA"=>"Communication",
-    "VZ"=>"Communication", "T"=>"Communication", "IBM"=>"Technology",
-    "MO"=>"Consumer Staples", "PM"=>"Consumer Staples", "MDLZ"=>"Consumer Staples",
-    "EXC"=>"Utilities", "KMB"=>"Consumer Staples", "PAYX"=>"Industrials",
-    "TROW"=>"Financials", "PFG"=>"Financials", "SO"=>"Utilities",
-    "DUK"=>"Utilities", "ED"=>"Utilities", "LNT"=>"Utilities",
-    "GIS"=>"Consumer Staples", "CAG"=>"Consumer Staples", "REG"=>"Real Estate",
-    "CPB"=>"Consumer Staples",
-    "TSLA"=>"Consumer Discretionary", "NVDA"=>"Technology", "AMD"=>"Technology",
-    "AAPL"=>"Technology", "MSFT"=>"Technology", "AMZN"=>"Consumer Discretionary",
-    "GOOG"=>"Communication", "META"=>"Communication", "NFLX"=>"Communication",
-    "DVN"=>"Energy",
-);
-universe_df[!, :sector] = [get(sector_map, t, "Unknown") for t in all_tickers];
+earnings_cal = load_earnings_calendar(all_tickers; year=Dates.year(today));
 
-sector_weights = combine(groupby(universe_df, :sector), :weight => sum => :total_weight);
-sort!(sector_weights, :total_weight, rev=true);
-sector_weights[!, :pct] = sector_weights.total_weight .* 100;
-println("Sector Weights:")
-pretty_table(sector_weights[:, [:sector, :pct]], column_labels = ["Sector", "Weight (%)"]);
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: TODAY'S MARKET SNAPSHOT
+# ══════════════════════════════════════════════════════════════════════════════
 
-# SECTION 8: Final Summary
-println("\nComplete Universe (35 names):")
-display_df = select(universe_df, :ticker, :sleeve, :sector, :div_yield, :weight, :notional);
-display_df[!, :weight_pct] = display_df.weight .* 100;
-display_df[!, :block_a] = fill(block_a_shares, nrow(display_df));
-display_df[!, :block_b] = fill(block_b_shares, nrow(display_df));
-pretty_table(
-    display_df[:, [:ticker, :sleeve, :sector, :div_yield, :weight_pct, :notional, :block_a, :block_b]],
-    column_labels = ["Ticker", "Sleeve", "Sector", "Div(%)", "Wt(%)", "Notional(\$)", "Hold", "Wheel"]);
+trading_days = get_trading_days(price_data);
+last_day = trading_days[end]
 
-tw = sum(universe_df.weight);
-println("\nAllocation Check:")
-println("  Total weight: $(round(tw*100, digits=2))%")
-println("  Safe: $(round(sum(universe_df.weight[universe_df.sleeve .== "Safe"])*100, digits=2))%")
-println("  Aggr: $(round(sum(universe_df.weight[universe_df.sleeve .== "Aggressive"])*100, digits=2))%")
-println("  Max per-name: $(round(maximum(universe_df.weight)*100, digits=2))% (cap: $(max_per_name*100)%)")
-println("  Portfolio construction complete.")
+println("\n── Market Snapshot ($(last_day)) ──")
+snapshot_df = DataFrame(
+    Ticker=String[], Sleeve=String[], Price=Float64[],
+    RV_30d=Float64[], IV=Float64[], NearEarnings=String[],
+    DivYield=Float64[]
+)
+
+config = default_config()
+
+for (i, tk) in enumerate(all_tickers)
+    pdf = get(price_data, tk, nothing)
+    pdf === nothing && continue
+    p = get_price_on_date(pdf, last_day)
+    p === nothing && continue
+
+    rv_dict = get(rolling_vol, tk, Dict{Date,Float64}())
+    iv_dict = get(rolling_iv, tk, Dict{Date,Float64}())
+    rv = get(rv_dict, last_day, NaN)
+    iv = get(iv_dict, last_day, NaN)
+    q = get(div_yields, tk, 0.0)
+    near_earn = near_earnings(earnings_cal, tk, last_day, config.earnings_buffer_days)
+
+    push!(snapshot_df, (
+        tk, sleeves[i], round(p, digits=2),
+        round(rv*100, digits=1), round(iv*100, digits=1),
+        near_earn ? "⚠ YES" : "no",
+        round(q*100, digits=2)
+    ))
+end
+pretty_table(snapshot_df,
+    column_labels=["Ticker", "Sleeve", "Price", "RV(%)", "IV(%)", "Earnings?", "Div q(%)"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: GENERATE TRADE SIGNALS
+# ══════════════════════════════════════════════════════════════════════════════
+
+println("\n── Trade Signals for $(last_day) ──")
+println("  (These are recommendations based on the Wheel engine logic)\n")
+
+signals_df = DataFrame(
+    Ticker=String[], Action=String[], Type=String[],
+    Strike=Float64[], Expiry=Date[], Premium=Float64[],
+    Delta=Float64[], Reason=String[]
+)
+
+for (i, tk) in enumerate(all_tickers)
+    pdf = get(price_data, tk, nothing)
+    pdf === nothing && continue
+    p = get_price_on_date(pdf, last_day)
+    p === nothing && continue
+
+    rv_dict = get(rolling_vol, tk, Dict{Date,Float64}())
+    iv_dict = get(rolling_iv, tk, Dict{Date,Float64}())
+    σ = get(rv_dict, last_day, get(vol_map, tk, 0.25))
+    σ_iv = get(iv_dict, last_day, σ)
+    q = get(div_yields, tk, 0.0)
+    near_earn = near_earnings(earnings_cal, tk, last_day, config.earnings_buffer_days)
+
+    if near_earn && config.earnings_policy == :avoid
+        push!(signals_df, (tk, "SKIP", "-", 0.0, last_day, 0.0, 0.0, "Near earnings — avoid"))
+        continue
+    end
+
+    sleeve = sleeves[i]
+    state_tmp = TickerState(tk, sleeve, 0, 0.0, LadderSlot[], 0.0, 0.0)
+
+    for otype in [:put, :call]
+        delta = get_target_delta(state_tmp, config, otype; σ=σ, near_earn=near_earn)
+        tenor = select_tenor(config, last_day; σ=σ)
+        expiry = find_expiry(last_day, tenor)
+        T = max(Dates.value(expiry - last_day) / 365.0, 1.0/365.0)
+
+        K = strike_from_delta(p, T, config.risk_free_rate, σ, delta, otype; q=q)
+        prem = max(option_price(p, K, T, config.risk_free_rate, σ_iv, otype;
+                                steps=config.crr_steps, q=q), 0.01)
+
+        action = otype == :put ? "SELL PUT" : "SELL CALL"
+        reason = near_earn ? "earnings: $(config.earnings_policy)" : "normal"
+
+        push!(signals_df, (
+            tk, action, string(otype),
+            K, expiry, round(prem, digits=2),
+            round(delta, digits=3), reason
+        ))
+    end
+end
+
+pretty_table(signals_df,
+    column_labels=["Ticker", "Action", "Type", "Strike", "Expiry", "Premium(\$)", "|Δ|", "Reason"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: RISK SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+
+println("\n── Risk Summary ──")
+total_premium = sum(signals_df.Premium)
+println("  Total potential daily premium: \$$(round(total_premium, digits=2))")
+println("  Tickers near earnings: $(count(signals_df.Reason .== "Near earnings — avoid"))")
+println("  Active trade signals: $(count(signals_df.Action .!= "SKIP"))")
+println("\n  ⚠ These are MODEL outputs — verify with live market data before trading.")
+println("  ⚠ Check real bid/ask, OI, and volume before executing.\n")

@@ -86,8 +86,9 @@ Base.@kwdef struct WheelConfig
     mgmt_fee_annual::Float64 = 0.0068
     max_ladders::Int = 1
     earnings_buffer_days::Int = 5
-    earnings_policy::Symbol = :avoid
+    earnings_policy::Symbol = :avoid       # :avoid, :widen, or :reduce_size
     earnings_wider_delta::Float64 = 0.05
+    earnings_size_reduction::Float64 = 0.50 # reduce contracts to 50% near earnings
     bid_ask_spread_model::Bool = true
     crr_steps::Int = 50
     # Extended cost model (PDF §5, §7A) — TODO item 6
@@ -328,9 +329,10 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
     delta = get_target_delta(state, config, otype; σ=σ, near_earn=near_earn,
                               drawdown_pct=drawdown_pct)
 
-    if earnings_cal !== nothing && config.earnings_policy == :widen &&
-       near_earnings(earnings_cal, state.ticker, date, config.earnings_buffer_days)
-        delta = max(0.10, delta - config.earnings_wider_delta)
+    if earnings_cal !== nothing && near_earn
+        if config.earnings_policy == :widen
+            delta = max(0.10, delta - config.earnings_wider_delta)
+        end
     end
 
     tenor = select_tenor(config, date; σ=σ)
@@ -350,6 +352,14 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
         max(1, round(Int, slot.num_contracts * fill_rate))
     else
         slot.num_contracts
+    end
+
+    # :reduce_size — trade through earnings but with fewer contracts
+    # Size = 50% of normal (configurable via earnings_size_reduction).
+    # Rationale: earnings vol crush makes selling options attractive,
+    # but gap risk is high, so reduce notional exposure.
+    if earnings_cal !== nothing && near_earn && config.earnings_policy == :reduce_size
+        effective_contracts = max(1, round(Int, effective_contracts * config.earnings_size_reduction))
     end
 
     slot.option = OptionPosition(otype, K, expiry, prem, date)
@@ -764,6 +774,7 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                     skip = risk_throttled
                     skip = skip || (earnings_cal !== nothing &&
                                     config.earnings_policy == :avoid && is_near_earn)
+                    # :widen and :reduce_size pass through (handled inside open_option!)
                     skip = skip || !check_name_weight(state, p, current_nav, config)
                     if sector_map !== nothing
                         skip = skip || !check_sector_cap(tk, sector_map, portfolio, cp, current_nav)

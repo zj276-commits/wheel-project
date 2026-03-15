@@ -150,11 +150,27 @@ function compute_return_correlation(price_data::Dict{String, DataFrame},
 end
 
 # ── Implied Volatility Calibration ────────────────────────────────────────────
+# ⚠ SELF-DESIGNED — entire IV calibration module is original work.
+# No course reference or textbook formula was used.
+# Motivated by Varner PDF §7B: "calibrated to each name's IV surface."
+#
+# The VRP concept is well-established in academic finance:
+#   Carr & Wu (2009) "Variance Risk Premiums"
+#   Bollerslev, Tauchen & Zhou (2009) "Expected Stock Returns and Variance Risk Premia"
+# But our specific parametric model (VRP × term × skew × volvol) is original.
+#
+# ⚠ DATA NEEDED FOR BETTER CALIBRATION:
+#   Currently uses fixed multipliers (Safe=1.15×, Aggressive=1.25×).
+#   For production accuracy, you would need:
+#   1. Real options chain data (bid/ask for multiple strikes) → use estimate_implied_vol()
+#      to extract actual IV → regress IV/RV ratio per ticker
+#   2. VIX historical data → make VRP time-varying (VRP spikes during market panics)
+#   3. CBOE DataShop or OptionMetrics subscription for historical IV surfaces
 
 """
     IVCalibration
 
-Parameters for converting realized volatility to implied volatility.
+⚠ SELF-DESIGNED — Parametric model for converting realized vol to implied vol.
 
 The variance risk premium (VRP) is one of the most robust findings in
 empirical finance: implied volatility systematically exceeds realized
