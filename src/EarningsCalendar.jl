@@ -21,7 +21,8 @@ Load earnings dates from `data/earnings_calendar.csv` if available.
 Expected CSV format: ticker,date (one row per earnings event).
 Falls back to per-company estimated dates if CSV is missing.
 """
-function load_earnings_calendar(tickers::Vector{String}; year::Int=2025)::EarningsCalendar
+function load_earnings_calendar(tickers::Vector{String}; year::Int=2025,
+                                 try_fetch::Bool=false)::EarningsCalendar
     path = joinpath(_PATH_TO_DATA, "earnings_calendar.csv")
     if isfile(path)
         df = CSV.read(path, DataFrame)
@@ -36,9 +37,20 @@ function load_earnings_calendar(tickers::Vector{String}; year::Int=2025)::Earnin
             sort!(v)
         end
         return EarningsCalendar(dates)
-    else
-        return estimate_earnings_calendar(tickers; year=year)
     end
+
+    cal = estimate_earnings_calendar(tickers; year=year)
+
+    if try_fetch
+        for ticker in tickers
+            fetched = fetch_earnings_dates(ticker; year=year)
+            if !isempty(fetched)
+                cal.dates[ticker] = fetched
+            end
+        end
+    end
+
+    return cal
 end
 
 const KNOWN_EARNINGS_PATTERNS = Dict{String, Vector{Tuple{Int,Int}}}(
@@ -101,7 +113,8 @@ function fetch_earnings_dates(ticker::String; year::Int=2025)::Vector{Date}
             return [Date(unix2datetime(d[:raw])) for d in raw_date if haskey(d, :raw)]
         end
         return Date[]
-    catch
+    catch e
+        @debug "fetch_earnings_dates failed for $ticker: $e"
         return Date[]
     end
 end

@@ -311,17 +311,19 @@ end
 """
     open_option!(state, slot, price, date, σ, config, portfolio; ...) -> Float64
 
-Open a new option. Enhancements:
-  - Pass dividend yield q to CRR pricing (TODO item 4)
-  - Liquidity screen check (TODO item 2)
-  - Partial fill adjustment (TODO item 5)
-  - Adaptive delta (TODO item 13)
+Open a new option. Uses realized vol (σ) for delta targeting and implied vol
+(σ_iv) for premium pricing.
+
+σ_iv defaults to σ if not provided (backward compatible).
 """
 function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
                       date::Date, σ::Float64, config::WheelConfig,
                       portfolio::Portfolio;
                       earnings_cal=nothing, q::Float64=0.0,
-                      near_earn::Bool=false, drawdown_pct::Float64=0.0)::Float64
+                      near_earn::Bool=false, drawdown_pct::Float64=0.0,
+                      σ_iv::Float64=NaN)::Float64
+    pricing_vol = isnan(σ_iv) ? σ : σ_iv
+
     otype = slot.phase == SELLING_PUT ? :put : :call
     delta = get_target_delta(state, config, otype; σ=σ, near_earn=near_earn,
                               drawdown_pct=drawdown_pct)
@@ -336,7 +338,7 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
     T = max(Dates.value(expiry - date) / 365.0, 1.0/365.0)
 
     K = strike_from_delta(price, T, config.risk_free_rate, σ, delta, otype; q=q)
-    prem = max(option_price(price, K, T, config.risk_free_rate, σ, otype;
+    prem = max(option_price(price, K, T, config.risk_free_rate, pricing_vol, otype;
                             steps=config.crr_steps, q=q), 0.01)
 
     liq_ok, fill_rate = check_liquidity(prem, σ, config)
@@ -358,13 +360,16 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
     return total
 end
 
-"""Mark-to-market value of slot's open option using CRR American pricing."""
+"""Mark-to-market value of slot's open option using CRR American pricing.
+Uses σ_iv (implied vol) for MTM if provided, else falls back to σ (realized vol)."""
 function close_option_mtm(slot::LadderSlot, price::Float64, date::Date,
-                          σ::Float64, config::WheelConfig; q::Float64=0.0)::Float64
+                          σ::Float64, config::WheelConfig;
+                          q::Float64=0.0, σ_iv::Float64=NaN)::Float64
     opt = slot.option
     opt === nothing && return 0.0
     T = max(Dates.value(opt.expiry - date) / 365.0, 0.0)
-    return option_price(price, opt.strike, T, config.risk_free_rate, σ, opt.type;
+    pricing_vol = isnan(σ_iv) ? σ : σ_iv
+    return option_price(price, opt.strike, T, config.risk_free_rate, pricing_vol, opt.type;
                         steps=config.crr_steps, q=q) * 100.0 * slot.num_contracts
 end
 
@@ -438,19 +443,21 @@ function should_roll(slot::LadderSlot, date::Date, price::Float64,
     return false
 end
 
-"""Close current option at market and open a new one (roll forward)."""
+"""Close current option at market and open a new one (roll forward).
+Uses σ_iv for pricing if provided."""
 function roll_option!(state::TickerState, slot::LadderSlot, price::Float64,
                       date::Date, σ::Float64, config::WheelConfig,
                       portfolio::Portfolio; earnings_cal=nothing, q::Float64=0.0,
-                      near_earn::Bool=false, drawdown_pct::Float64=0.0)::Float64
-    cc = close_option_mtm(slot, price, date, σ, config; q=q)
+                      near_earn::Bool=false, drawdown_pct::Float64=0.0,
+                      σ_iv::Float64=NaN)::Float64
+    cc = close_option_mtm(slot, price, date, σ, config; q=q, σ_iv=σ_iv)
     portfolio.cash -= cc
     slot.total_premium -= cc
     apply_trade_costs!(state, slot, cc, σ, config, portfolio)
     slot.option = nothing
     np = open_option!(state, slot, price, date, σ, config, portfolio;
                       earnings_cal=earnings_cal, q=q, near_earn=near_earn,
-                      drawdown_pct=drawdown_pct)
+                      drawdown_pct=drawdown_pct, σ_iv=σ_iv)
     portfolio.cash += np
     return np - cc
 end
@@ -599,7 +606,7 @@ function initialize_portfolio(tickers::Vector{String}, sleeves::Vector{String},
                                      0.0, 0.0, 0, 0, 0, 0, 0, 0))
         end
 
-        states[ticker] = TickerState(ticker, sleeves[i], ba, price, slots, 0.0, 0.0)
+        states[ticker] = TickerState(ticker, sleeves[i], ba, ba * price, slots, 0.0, 0.0)
     end
     return Portfolio(initial_nav - total_cost, initial_nav, states, DailyRecord[], config)
 end
@@ -608,12 +615,13 @@ end
 
 """
 Compute daily NAV: cash + Block A equity + Block B equity + option MTM.
-Also computes portfolio-level Greeks (TODO item 9).
+Also computes portfolio-level Greeks. Uses rolling_iv for option MTM if available.
 """
 function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                      date::Date, vol_map::Dict{String, Float64},
                      config::WheelConfig;
-                     rolling_vol=nothing, div_yields=nothing)::DailyRecord
+                     rolling_vol=nothing, div_yields=nothing,
+                     rolling_iv=nothing)::DailyRecord
     sv, omtm, bav, tp, td, tc = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     p_delta, p_gamma, p_vega = 0.0, 0.0, 0.0
 
@@ -622,20 +630,27 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         isnan(p) && continue
         σ = _resolve_vol(rolling_vol, vol_map, tk, date)
         q = div_yields !== nothing ? get(div_yields, tk, 0.0) : 0.0
+        pricing_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
+            get(rolling_iv[tk], date, σ)
+        else
+            σ
+        end
 
         bav += state.block_a_shares * p
         for slot in state.slots
             sv += slot.shares_held * p
             if slot.option !== nothing
                 T = max(Dates.value(slot.option.expiry - date) / 365.0, 0.0)
-                opt_val = option_price(p, slot.option.strike, T, config.risk_free_rate, σ,
-                                       slot.option.type; steps=config.crr_steps, q=q)
+                opt_val = option_price(p, slot.option.strike, T, config.risk_free_rate,
+                                       pricing_vol, slot.option.type;
+                                       steps=config.crr_steps, q=q)
                 omtm -= opt_val * 100.0 * slot.num_contracts
 
                 if T > 0.0
-                    g = option_greeks(p, slot.option.strike, T, config.risk_free_rate, σ,
-                                      slot.option.type; N=config.crr_steps, q=q)
-                    sign = -1.0  # short options
+                    g = option_greeks(p, slot.option.strike, T, config.risk_free_rate,
+                                      pricing_vol, slot.option.type;
+                                      N=config.crr_steps, q=q)
+                    sign = -1.0
                     n = 100.0 * slot.num_contracts
                     p_delta += sign * g.delta * n
                     p_gamma += sign * g.gamma * n
@@ -668,14 +683,18 @@ end
 """
     run_backtest!(portfolio, price_data, div_data, vol_map, trading_days; ...)
 
-Day-by-day Wheel strategy simulation with risk overlays (TODO item 3),
-name weight caps (TODO item 8), and sector caps.
+Day-by-day Wheel strategy simulation with risk overlays, name weight caps,
+sector caps, and IV calibration.
+
+rolling_iv — implied vol lookup Dict{String, Dict{Date, Float64}}.
+When provided, option pricing uses σ_IV while delta targeting uses σ_RV.
 """
 function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame},
                        div_data::Dict{String, DataFrame}, vol_map::Dict{String, Float64},
                        trading_days::Vector{Date};
                        earnings_cal=nothing, rolling_vol=nothing,
-                       sector_map=nothing, div_yields=nothing)
+                       sector_map=nothing, div_yields=nothing,
+                       rolling_iv=nothing)
     config = portfolio.config
     dfee = config.mgmt_fee_annual / 252.0
 
@@ -716,6 +735,12 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             q = div_yields !== nothing ? get(div_yields, tk, 0.0) : 0.0
             ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
 
+            σ_iv_val = if rolling_iv !== nothing && haskey(rolling_iv, tk)
+                get(rolling_iv[tk], date, NaN)
+            else
+                NaN
+            end
+
             check_dividends!(state, date, ddf, portfolio)
 
             is_near_earn = earnings_cal !== nothing &&
@@ -731,7 +756,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                 if should_roll(slot, date, p, σ, config)
                     roll_option!(state, slot, p, date, σ, config, portfolio;
                                  earnings_cal=earnings_cal, q=q,
-                                 near_earn=is_near_earn, drawdown_pct=drawdown_pct)
+                                 near_earn=is_near_earn, drawdown_pct=drawdown_pct,
+                                 σ_iv=σ_iv_val)
                 end
 
                 if slot.option === nothing
@@ -747,7 +773,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                         portfolio.cash += open_option!(state, slot, p, date, σ, config,
                                                        portfolio; earnings_cal=earnings_cal,
                                                        q=q, near_earn=is_near_earn,
-                                                       drawdown_pct=drawdown_pct)
+                                                       drawdown_pct=drawdown_pct,
+                                                       σ_iv=σ_iv_val)
                     end
                 end
 
@@ -757,7 +784,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
 
         push!(portfolio.daily_records, compute_nav(portfolio, cp, date, vol_map, config;
                                                     rolling_vol=rolling_vol,
-                                                    div_yields=div_yields))
+                                                    div_yields=div_yields,
+                                                    rolling_iv=rolling_iv))
     end
 end
 

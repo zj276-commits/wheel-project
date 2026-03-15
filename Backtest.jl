@@ -83,6 +83,14 @@ div_data = download_all_dividends(all_tickers, start_date, end_date);
 rolling_vol = compute_rolling_volatility(price_data; window=30);
 div_yields = compute_dividend_yields(div_data, price_data);
 
+# ── Step 4b: Calibrate implied volatility (VRP model) ─────────────────────
+
+sleeves_map = Dict{String, String}(
+    all_tickers[i] => sleeves[i] for i in 1:length(all_tickers)
+)
+rolling_iv = compute_rolling_iv(rolling_vol, sleeves_map);
+println("  IV calibration: $(length(rolling_iv)) tickers calibrated")
+
 # ── Step 5: Load earnings calendar ──────────────────────────────────────────
 
 earnings_cal = load_earnings_calendar(all_tickers; year=2025);
@@ -138,7 +146,8 @@ portfolio = initialize_portfolio(all_tickers, sleeves, weights, initial_nav,
 
 run_backtest!(portfolio, price_data, div_data, vol_map, trading_days;
               earnings_cal=earnings_cal, rolling_vol=rolling_vol,
-              sector_map=sector_map, div_yields=div_yields);
+              sector_map=sector_map, div_yields=div_yields,
+              rolling_iv=rolling_iv);
 
 # ── Step 9: Report ───────────────────────────────────────────────────────────
 
@@ -224,7 +233,8 @@ if RUN_PARAMETER_SWEEP
         pf = initialize_portfolio(all_tickers, sleeves, sw, initial_nav, prices_day1, cfg)
         run_backtest!(pf, price_data, div_data, vol_map, trading_days;
                       earnings_cal=earnings_cal, rolling_vol=rolling_vol,
-                      sector_map=sector_map, div_yields=div_yields)
+                      sector_map=sector_map, div_yields=div_yields,
+                      rolling_iv=rolling_iv)
 
         recs = pf.daily_records
         isempty(recs) && continue
@@ -285,9 +295,11 @@ if RUN_STRESS_TEST
         pf = initialize_portfolio(all_tickers, sleeves, weights, initial_nav, prices_day1, config)
         stressed_days = get_trading_days(stressed_prices)
 
+        stressed_iv = compute_rolling_iv(stressed_rolling, sleeves_map)
         run_backtest!(pf, stressed_prices, div_data, vol_map, stressed_days;
                       earnings_cal=earnings_cal, rolling_vol=stressed_rolling,
-                      sector_map=sector_map, div_yields=div_yields)
+                      sector_map=sector_map, div_yields=div_yields,
+                      rolling_iv=stressed_iv)
 
         recs = pf.daily_records
         isempty(recs) && continue

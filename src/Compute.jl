@@ -1,6 +1,6 @@
 """
 Quantitative computations: log growth matrix, rolling volatility, dividend yield,
-and implied volatility surface estimation.
+implied volatility calibration, and return correlation.
 
 log_growth_matrix: excess log return matrix for cross-sectional analysis.
   Reference: CHEME-5660 Week 5b — SAGBM parameter estimation.
@@ -9,9 +9,15 @@ compute_rolling_volatility: time-varying σ for each ticker.
   Self-designed (no direct course reference).
 
 compute_dividend_yields: annualized dividend yield per ticker.
-  Used to pass q to CRR pricing for accurate American option valuation (TODO item 4).
+  Used to pass q to CRR pricing for accurate American option valuation.
 
-compute_return_correlation: pairwise correlation matrix for correlated MC (TODO item 10).
+calibrate_implied_vol: variance risk premium model to convert realized vol → implied vol.
+  Motivated by Varner PDF §7B: "calibrated to each name's IV surface."
+  Uses the well-documented volatility risk premium (IV > RV) with term structure
+  and moneyness (skew) adjustments.
+
+compute_return_correlation: pairwise correlation matrix for correlated MC.
+  Reference: CHEME-5660 Week 6 — Multiple-Asset GBM with Cholesky decomposition.
 """
 
 """
@@ -22,7 +28,7 @@ Compute the excess log growth matrix for a set of firms (CHEME-5660 Week 5b):
 """
 function log_growth_matrix(dataset::Dict{String, DataFrame},
     firms::Array{String,1}; Δt::Float64 = (1.0/252.0), risk_free_rate::Float64 = 0.0,
-    testfirm="AAPL", keycol::Symbol = :volume_weighted_average_price)::Array{Float64,2}
+    testfirm="AAPL", keycol::Symbol = :adj_close)::Array{Float64,2}
 
     number_of_firms = length(firms)
     number_of_trading_days = nrow(dataset[testfirm])
@@ -141,4 +147,119 @@ function compute_return_correlation(price_data::Dict{String, DataFrame},
     end
 
     return ρ
+end
+
+# ── Implied Volatility Calibration ────────────────────────────────────────────
+
+"""
+    IVCalibration
+
+Parameters for converting realized volatility to implied volatility.
+
+The variance risk premium (VRP) is one of the most robust findings in
+empirical finance: implied volatility systematically exceeds realized
+volatility. Option sellers earn this premium for bearing volatility risk.
+
+Model:  σ_IV(S, K, T) = σ_RV × vrp_multiplier × term_adjustment(T) × skew_adjustment(moneyness)
+
+Components:
+  vrp_multiplier — base IV/RV ratio (empirically 1.1–1.3 for equity options)
+  term_adjustment — shorter-dated options have higher IV/RV ratio
+  skew_adjustment — OTM puts have higher IV (negative skew in equities)
+"""
+struct IVCalibration
+    vrp_multiplier::Float64     # base IV/RV ratio
+    term_slope::Float64         # term structure: IV/RV increases as T → 0
+    skew_slope::Float64         # put skew: IV increases for OTM puts
+    vol_of_vol::Float64         # IV increases more when RV is already high
+end
+
+"""
+    default_iv_calibration(sleeve) -> IVCalibration
+
+Default IV calibration parameters by sleeve type.
+Aggressive (high-vol) names have higher VRP and steeper skew.
+"""
+function default_iv_calibration(sleeve::String)::IVCalibration
+    if sleeve == "Aggressive"
+        return IVCalibration(1.25, 0.15, 0.08, 0.10)
+    else
+        return IVCalibration(1.15, 0.10, 0.05, 0.05)
+    end
+end
+
+"""
+    calibrate_iv(σ_rv, T, moneyness, cal) -> Float64
+
+Convert realized volatility to implied volatility using the VRP model.
+
+Arguments:
+  σ_rv      — annualized realized vol from rolling window
+  T         — time to expiry in years
+  moneyness — (S - K) / S, negative for OTM puts, positive for OTM calls
+  cal       — IVCalibration parameters
+
+Model:
+  σ_IV = σ_RV × VRP × (1 + term_adj) × (1 + skew_adj) × (1 + volvol_adj)
+
+  term_adj  = term_slope × max(0, 30/365 - T) / (30/365)
+    → increases IV for options shorter than 30 DTE
+
+  skew_adj  = skew_slope × max(0, -moneyness)
+    → increases IV for OTM puts (negative moneyness)
+
+  volvol_adj = vol_of_vol × max(0, σ_RV - 0.30)
+    → IV rises faster than RV in high-vol environments
+"""
+function calibrate_iv(σ_rv::Float64, T::Float64, moneyness::Float64,
+                       cal::IVCalibration)::Float64
+    σ_rv <= 0.0 && return 0.01
+
+    term_adj = cal.term_slope * max(0.0, (30.0/365.0 - T) / (30.0/365.0))
+
+    skew_adj = cal.skew_slope * max(0.0, -moneyness)
+
+    volvol_adj = cal.vol_of_vol * max(0.0, σ_rv - 0.30)
+
+    σ_iv = σ_rv * cal.vrp_multiplier * (1.0 + term_adj) * (1.0 + skew_adj) * (1.0 + volvol_adj)
+
+    return clamp(σ_iv, 0.01, 5.0)
+end
+
+"""
+    compute_rolling_iv(rolling_vol, sleeves_map; iv_cals=nothing) -> Dict{String, Dict{Date, Float64}}
+
+Convert rolling realized vol to rolling implied vol for all tickers.
+Applies the VRP model with default ATM moneyness and 30-day tenor.
+
+This is the primary integration point: the backtest can use this instead of
+rolling_vol to price options with implied volatility.
+
+Arguments:
+  rolling_vol  — Dict{String, Dict{Date, Float64}} from compute_rolling_volatility
+  sleeves_map  — Dict{String, String} mapping ticker → sleeve ("Safe" or "Aggressive")
+  iv_cals      — optional Dict{String, IVCalibration} for per-ticker overrides
+"""
+function compute_rolling_iv(rolling_vol::Dict{String, Dict{Date, Float64}},
+                              sleeves_map::Dict{String, String};
+                              iv_cals::Union{Nothing, Dict{String, IVCalibration}}=nothing
+                              )::Dict{String, Dict{Date, Float64}}
+    result = Dict{String, Dict{Date, Float64}}()
+
+    for (ticker, vol_dict) in rolling_vol
+        sleeve = get(sleeves_map, ticker, "Safe")
+        cal = if iv_cals !== nothing && haskey(iv_cals, ticker)
+            iv_cals[ticker]
+        else
+            default_iv_calibration(sleeve)
+        end
+
+        iv_dict = Dict{Date, Float64}()
+        for (date, σ_rv) in vol_dict
+            iv_dict[date] = calibrate_iv(σ_rv, 30.0/365.0, 0.0, cal)
+        end
+        result[ticker] = iv_dict
+    end
+
+    return result
 end

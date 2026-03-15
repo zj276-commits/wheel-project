@@ -101,7 +101,8 @@ function simulate_correlated_gbm(S₀::Vector{Float64}, μ::Vector{Float64},
     ρ_pd = ρ + 1e-8 * I
     L = try
         cholesky(Hermitian(ρ_pd)).L
-    catch
+    catch e
+        @warn "Cholesky decomposition failed, using independent paths: $e"
         Matrix{Float64}(I, n_assets, n_assets)
     end
 
@@ -280,7 +281,7 @@ function run_stress_scenarios(S₀::Float64, μ::Float64, σ::Float64, T::Float6
                                n_paths::Int=5000, Δt::Float64=1.0/252.0)::DataFrame
     results = DataFrame(
         Scenario=String[], MeanReturn=Float64[], MedianReturn=Float64[],
-        VaR95=Float64[], MaxDD=Float64[], PctBelow80=Float64[]
+        VaR95=Float64[], MaxDD=Float64[], PctBelowMinus20=Float64[]
     )
 
     for sc in scenarios

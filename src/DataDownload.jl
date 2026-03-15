@@ -29,17 +29,23 @@ function download_price_data(ticker::String, start_date::Date, end_date::Date)::
 
     raw = get_prices(ticker, startdt=sd, enddt=ed, interval="1d")
 
+    if !haskey(raw, "timestamp") || isempty(raw["timestamp"])
+        @warn "No price data returned for $ticker"
+        return DataFrame(date=Date[], open=Float64[], high=Float64[], low=Float64[],
+                         close=Float64[], adj_close=Float64[], volume=Float64[])
+    end
+
     timestamps = raw["timestamp"]
     dates = _to_dates(timestamps)
 
     df = DataFrame(
         date      = dates,
-        open      = _to_float_vec(raw["open"]),
-        high      = _to_float_vec(raw["high"]),
-        low       = _to_float_vec(raw["low"]),
-        close     = _to_float_vec(raw["close"]),
-        adj_close = _to_float_vec(raw["adjclose"]),
-        volume    = _to_float_vec(raw["vol"]),
+        open      = _to_float_vec(get(raw, "open", fill(NaN, length(dates)))),
+        high      = _to_float_vec(get(raw, "high", fill(NaN, length(dates)))),
+        low       = _to_float_vec(get(raw, "low", fill(NaN, length(dates)))),
+        close     = _to_float_vec(get(raw, "close", fill(NaN, length(dates)))),
+        adj_close = _to_float_vec(get(raw, "adjclose", get(raw, "close", fill(NaN, length(dates))))),
+        volume    = _to_float_vec(get(raw, "vol", fill(0.0, length(dates)))),
     )
 
     filter!(row -> !isnan(row.close), df)
@@ -87,6 +93,11 @@ function download_dividends(ticker::String, start_date::Date, end_date::Date)::D
     ed = Dates.format(end_date, "yyyy-mm-dd")
 
     raw = get_prices(ticker, startdt=sd, enddt=ed, interval="1d", divsplits=true)
+
+    if !haskey(raw, "timestamp") || isempty(raw["timestamp"]) || !haskey(raw, "div")
+        CSV.write(cache_file, DataFrame(ex_date=Date[], amount=Float64[]))
+        return DataFrame(ex_date=Date[], amount=Float64[])
+    end
 
     timestamps = raw["timestamp"]
     dates = _to_dates(timestamps)
