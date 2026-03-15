@@ -90,17 +90,20 @@ safe_tickers = [
     "CPB",    # Campbell Soup — Consumer Staples, ~6.2% div
 ];
 
+# Aggressive sleeve (Varner PDF §3): top-quintile volatility and deep options markets.
+# PDF explicitly names NVDA, AMD, TSLA as examples. Selected 10 names for best balance
+# of premium generation, options liquidity, and sector diversity.
 aggressive_tickers = [
-    "FITB",   # Fifth Third Bancorp — Financials, ~3.4% div
-    "HBAN",   # Huntington Bancshares — Financials, ~3.9% div
-    "HST",    # Host Hotels & Resorts — Real Estate, ~4.7% div
-    "HAS",    # Hasbro — Consumer Discretionary, ~4.5% div
-    "DVN",    # Devon Energy — Energy, ~5.0% div
-    "APA",    # APA Corp — Energy, ~3.1% div
-    "SWKS",   # Skyworks Solutions — Technology, ~5.2% div
-    "ZION",   # Zions Bancorporation — Financials, ~3.3% div
-    "LKQ",    # LKQ Corporation — Consumer Discretionary, ~3.8% div
-    "HAL",    # Halliburton — Energy, ~2.0% div
+    "TSLA",   # Tesla — Consumer Discretionary, σ=0.49 (PDF-named)
+    "NVDA",   # NVIDIA — Technology, σ=0.39 (PDF-named)
+    "AMD",    # AMD — Technology, σ=0.47 (PDF-named)
+    "AAPL",   # Apple — Technology, deepest options market globally
+    "MSFT",   # Microsoft — Technology, deepest options market globally
+    "AMZN",   # Amazon — Consumer Discretionary, deep options market
+    "GOOG",   # Alphabet — Communication, σ=0.31
+    "META",   # Meta Platforms — Communication, σ~0.30
+    "NFLX",   # Netflix — Communication, σ=0.36
+    "DVN",    # Devon Energy — Energy, σ=0.46 (sector diversity)
 ];
 
 all_tickers = vcat(safe_tickers, aggressive_tickers);
@@ -158,10 +161,11 @@ sector_map = Dict(
     "TROW"=>"Financials", "PFG"=>"Financials", "SO"=>"Utilities",
     "DUK"=>"Utilities", "ED"=>"Utilities", "LNT"=>"Utilities",
     "GIS"=>"Consumer Staples", "CAG"=>"Consumer Staples", "REG"=>"Real Estate",
-    "CPB"=>"Consumer Staples", "FITB"=>"Financials", "HBAN"=>"Financials",
-    "HST"=>"Real Estate", "HAS"=>"Consumer Discretionary",
-    "DVN"=>"Energy", "APA"=>"Energy", "SWKS"=>"Technology",
-    "ZION"=>"Financials", "LKQ"=>"Consumer Discretionary", "HAL"=>"Energy",
+    "CPB"=>"Consumer Staples",
+    "TSLA"=>"Consumer Discretionary", "NVDA"=>"Technology", "AMD"=>"Technology",
+    "AAPL"=>"Technology", "MSFT"=>"Technology", "AMZN"=>"Consumer Discretionary",
+    "GOOG"=>"Communication", "META"=>"Communication", "NFLX"=>"Communication",
+    "DVN"=>"Energy",
 );
 universe_df[!, :sector] = [get(sector_map, t, "Unknown") for t in all_tickers];
 
