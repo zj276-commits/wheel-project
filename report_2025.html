@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Wheel Strategy ETF Fund — System Report 2025</title>
+<style>
+  @page { size: A4; margin: 20mm; }
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', 'Microsoft YaHei', Arial, sans-serif; max-width: 960px; margin: 0 auto; padding: 30px; color: #1a202c; line-height: 1.6; font-size: 13px; }
+  h1 { color: #1a365d; font-size: 28px; border-bottom: 3px solid #2b6cb0; padding-bottom: 10px; margin-top: 40px; }
+  h2 { color: #2b6cb0; font-size: 20px; border-bottom: 1px solid #bee3f8; padding-bottom: 6px; margin-top: 30px; page-break-after: avoid; }
+  h3 { color: #2d3748; font-size: 16px; margin-top: 20px; page-break-after: avoid; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 20px 0; font-size: 12px; }
+  th, td { border: 1px solid #cbd5e0; padding: 6px 10px; text-align: left; }
+  th { background: #2d3748; color: #fff; font-weight: 600; }
+  tr:nth-child(even) { background: #f7fafc; }
+  code { background: #edf2f7; padding: 2px 5px; border-radius: 3px; font-size: 12px; font-family: 'Consolas', monospace; }
+  .formula { background: #ebf8ff; border-left: 4px solid #3182ce; padding: 10px 15px; margin: 12px 0; font-family: 'Consolas', monospace; font-size: 12px; }
+  .self-designed { background: #fffff0; border-left: 4px solid #d69e2e; padding: 8px 12px; margin: 10px 0; }
+  .chart-container { page-break-inside: avoid; margin: 15px 0; text-align: center; }
+  .chart-container img { max-width: 100%; height: auto; border: 1px solid #e2e8f0; border-radius: 4px; }
+  .chart-caption { font-size: 11px; color: #718096; margin-top: 4px; font-style: italic; }
+  .title-page { text-align: center; padding: 80px 0 60px 0; page-break-after: always; }
+  .title-page h1 { font-size: 36px; border: none; color: #1a365d; }
+  .title-page .subtitle { font-size: 18px; color: #4a5568; margin-top: 10px; }
+  .title-page .meta { font-size: 14px; color: #718096; margin-top: 40px; }
+  .priority-high { color: #e53e3e; font-weight: bold; }
+  .priority-mid { color: #d69e2e; font-weight: bold; }
+  .priority-low { color: #38a169; }
+  .toc { background: #f7fafc; padding: 20px; border-radius: 8px; margin: 20px 0; }
+  .toc a { text-decoration: none; color: #2b6cb0; }
+  .toc li { margin: 4px 0; }
+  @media print {
+    body { font-size: 11px; padding: 0; }
+    .title-page { padding: 120px 0 80px 0; }
+    h1 { page-break-before: always; }
+    h1:first-of-type { page-break-before: avoid; }
+    .chart-container { page-break-inside: avoid; }
+    table { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Title Page -->
+<div class="title-page">
+  <h1 style="font-size:36px;">Wheel Strategy ETF Fund</h1>
+  <div class="subtitle">Complete System Report — 2025 Backtest</div>
+  <div class="meta">
+    <p>Cornell University — CHEME-5660 Final Project</p>
+    <p>Framework: Julia | Pricing Model: CRR American Binomial Lattice</p>
+    <p>Initial NAV: $600,000,000 | Universe: 35 Names (25 Safe + 10 Aggressive)</p>
+    <p>Report Generated: March 2026</p>
+  </div>
+</div>
+
+<!-- Table of Contents -->
+<div class="toc">
+  <h2 style="margin-top:0; border:none;">Table of Contents / 目录</h2>
+  <ol>
+    <li><a href="#arch">System Architecture / 系统架构</a></li>
+    <li><a href="#data">Data Pipeline / 数据流</a></li>
+    <li><a href="#universe">Universe Construction / 投资组合构建</a></li>
+    <li><a href="#preprocess">Preprocessing Calculations / 预处理计算</a></li>
+    <li><a href="#pricing">Option Pricing Model / 期权定价模型</a></li>
+    <li><a href="#engine">Backtest Engine / 回测引擎</a></li>
+    <li><a href="#mc">Monte Carlo & Stress Testing / 蒙特卡洛与压力测试</a></li>
+    <li><a href="#charts">Results & Charts / 回测结果与图表</a></li>
+    <li><a href="#outputs">Output Files / 输出文件说明</a></li>
+    <li><a href="#course">Course Reference Mapping / 课程对照表</a></li>
+    <li><a href="#improve">Improvements / 可提升方向</a></li>
+  </ol>
+</div>
+
+<!-- Section 1: Architecture -->
+<h1 id="arch">1. System Architecture / 系统架构</h1>
+
+<p>The system consists of <strong>8 Julia source modules</strong> + <strong>2 entry-point scripts</strong>, loaded in dependency order by <code>Include.jl</code>.</p>
+
+<table>
+  <tr><th>File</th><th>Role / 职责</th></tr>
+  <tr><td><code>Include.jl</code></td><td>Environment setup: activate project, load packages, include src modules in dependency order</td></tr>
+  <tr><td><code>src/Files.jl</code></td><td>Data loaders: JLD2 market data, SAGBM parameters CSV, Finviz screener CSV</td></tr>
+  <tr><td><code>src/DataDownload.jl</code></td><td>Yahoo Finance API: download prices and dividends with CSV caching</td></tr>
+  <tr><td><code>src/Compute.jl</code></td><td>Quantitative: log-growth matrix, rolling volatility, dividend yield, IV calibration, correlation matrix</td></tr>
+  <tr><td><code>src/OptionPricing.jl</code></td><td>CRR American option pricing, Greeks (Δ,Γ,Θ,ν), strike_from_delta, implied vol solver</td></tr>
+  <tr><td><code>src/EarningsCalendar.jl</code></td><td>Earnings date management: CSV / estimation / Yahoo Finance fetch, near_earnings detection</td></tr>
+  <tr><td><code>src/MonteCarloSim.jl</code></td><td>GBM simulation, regime-switching GBM, correlated multi-asset GBM, HMM, stress testing</td></tr>
+  <tr><td><code>src/WheelEngine.jl</code></td><td>Core backtest engine: state machine, open/close/roll/repair, risk overlays, NAV computation, reporting</td></tr>
+  <tr><td><code>Backtest.jl</code></td><td><strong>Backtest entry point</strong>: universe construction → data loading → simulation → reporting</td></tr>
+  <tr><td><code>Wheel Strategy Code</code></td><td><strong>Live trading template</strong>: daily signal generation for real-time operations</td></tr>
+</table>
+
+<!-- Section 2: Data Pipeline -->
+<h1 id="data">2. Data Pipeline / 数据流</h1>
+
+<h3>Data Sources / 数据源</h3>
+<table>
+  <tr><th>Source</th><th>Description</th><th>Loader</th></tr>
+  <tr><td>JLD2 Market Data</td><td>S&P 500 2025 daily OHLC from Polygon.io (course-provided), for <code>log_growth_matrix</code></td><td><code>Files.jl → MyTestingMarketDataSet()</code></td></tr>
+  <tr><td>SAGBM Parameters CSV</td><td>Pre-computed drift μ and volatility σ per ticker (2014–2024), fallback source</td><td><code>Files.jl → load_sagbm_parameters()</code></td></tr>
+  <tr><td>Finviz Screener CSV</td><td>Dividend yield, market cap, volume for Safe-sleeve selection</td><td><code>Files.jl → load_finviz_screener()</code></td></tr>
+  <tr><td>Yahoo Finance Prices</td><td>Daily OHLC + adj_close, cached to <code>data/prices_2025/*.csv</code></td><td><code>DataDownload.jl → download_price_data()</code></td></tr>
+  <tr><td>Yahoo Finance Dividends</td><td>Ex-dividend dates + amounts, cached to <code>data/dividends_2025/*.csv</code></td><td><code>DataDownload.jl → download_dividends()</code></td></tr>
+  <tr><td>Yahoo Finance VIX</td><td>VIX index daily data for reference</td><td><code>DataDownload.jl</code></td></tr>
+  <tr><td>SPY Prices</td><td>S&P 500 ETF for benchmark buy-and-hold comparison</td><td><code>DataDownload.jl</code></td></tr>
+</table>
+
+<!-- Section 3: Universe -->
+<h1 id="universe">3. Universe Construction / 投资组合构建 (Varner PDF §3)</h1>
+
+<h3>Two-Sleeve Portfolio</h3>
+<table>
+  <tr><th>Sleeve</th><th># Names</th><th>Allocation</th><th>Per-Name Weight</th><th>Selection Criteria</th></tr>
+  <tr><td><strong>Safe</strong></td><td>25</td><td>60%</td><td>2.4%</td><td>Low volatility, high dividend yield (≥3%), deep options market</td></tr>
+  <tr><td><strong>Aggressive</strong></td><td>10</td><td>40%</td><td>4.0%</td><td>Top-quintile volatility, deep options market, sector diversity</td></tr>
+</table>
+
+<p><strong>Initial NAV:</strong> $600,000,000 &nbsp;|&nbsp; <strong>Per-name cap:</strong> ≤5% NAV &nbsp;|&nbsp; <strong>Sector cap:</strong> ≤25%</p>
+
+<h3>Two-Block Inventory per Ticker</h3>
+<table>
+  <tr><th>Block</th><th>Allocation</th><th>Purpose</th></tr>
+  <tr><td><strong>Block A</strong> (Hold)</td><td>50% of ticker allocation</td><td>Buy-and-hold for dividends + capital appreciation. No options sold.</td></tr>
+  <tr><td><strong>Block B</strong> (Wheel)</td><td>50% of ticker allocation</td><td>Active Wheel cycle: Sell Put → Assigned → Sell Call → Called Away → repeat</td></tr>
+</table>
+
+<h3>Safe Tickers (25)</h3>
+<p>PEP, KO, PG, JNJ, CME, CMCSA, VZ, T, IBM, MO, PM, MDLZ, EXC, KMB, PAYX, TROW, PFG, SO, DUK, ED, LNT, GIS, CAG, REG, CPB</p>
+
+<h3>Aggressive Tickers (10)</h3>
+<p>TSLA, NVDA, AMD, AAPL, MSFT, AMZN, GOOG, META, NFLX, DVN</p>
+
+<!-- Section 4: Preprocessing -->
+<h1 id="preprocess">4. Preprocessing Calculations / 预处理计算</h1>
+
+<h3>4.1 Log Growth Matrix (CHEME-5660 Week 5b)</h3>
+<div class="formula">
+  μ_{t,t-1}(r_f) = (1/Δt) · ln(S_t / S_{t-1}) − r_f<br>
+  where Δt = 1/252, r_f = risk-free rate
+</div>
+<p>Computes excess log returns for all tickers from the JLD2 dataset. Output is a (days × tickers) matrix used for cross-sectional volatility estimation.</p>
+
+<h3>4.2 30-Day Rolling Realized Volatility</h3>
+<div class="self-designed">⚠ SELF-DESIGNED — no direct course reference</div>
+<div class="formula">
+  σ_RV(t) = std(r_{t-29}, r_{t-28}, ..., r_t) × √252
+</div>
+<p>Annualized rolling volatility using a trailing 30-day window of daily log returns. Computed per ticker per trading day. Floor at 1% to avoid degenerate pricing.</p>
+
+<h3>4.3 Dividend Yield</h3>
+<div class="formula">
+  q = (Σ dividends over lookback) / (average price over lookback) / lookback_years
+</div>
+<p>Continuous dividend yield passed to CRR lattice for accurate American option valuation around ex-dividend dates.</p>
+
+<h3>4.4 Implied Volatility Calibration (VRP Model)</h3>
+<div class="self-designed">⚠ SELF-DESIGNED — Entire IV calibration module is original work.<br>
+  Academic motivation: Carr &amp; Wu (2009) "Variance Risk Premiums"; Bollerslev, Tauchen &amp; Zhou (2009).<br>
+  Our specific parametric model (VRP × term × skew × volvol) is original.</div>
+
+<div class="formula">
+  σ_IV = σ_RV × VRP × (1 + term_adj) × (1 + skew_adj) × (1 + volvol_adj)<br><br>
+  VRP multiplier:  Safe = 1.15×,  Aggressive = 1.25×<br>
+  term_adj  = term_slope × max(0, (30/365 − T) / (30/365))   → shorter options → higher IV/RV<br>
+  skew_adj  = skew_slope × max(0, −moneyness)                 → OTM puts → higher IV<br>
+  volvol_adj = vol_of_vol × max(0, σ_RV − 0.30)              → high-vol regime → IV rises faster
+</div>
+
+<p><strong>Data needed for better calibration:</strong></p>
+<ol>
+  <li>Real options chain data (bid/ask for multiple strikes) → extract actual IV</li>
+  <li>VIX historical data → make VRP time-varying</li>
+  <li>CBOE DataShop or OptionMetrics subscription for historical IV surfaces</li>
+</ol>
+
+<h3>4.5 Return Correlation Matrix (CHEME-5660 Week 6)</h3>
+<div class="formula">
+  ρ_{ij} = cor(r_i, r_j) on pairwise-complete observations<br>
+  Used for correlated multi-asset GBM via Cholesky: Z_corr = L · Z_indep, L = cholesky(ρ).L
+</div>
+
+<!-- Section 5: Pricing -->
+<h1 id="pricing">5. Option Pricing Model / 期权定价模型</h1>
+
+<h3>5.1 CRR Binomial Lattice — American Options (CHEME-5660 Week 10)</h3>
+<div class="formula">
+  Δt = T / N<br>
+  u = exp(σ · √Δt),  d = 1/u<br>
+  p = (e^{(r−q)Δt} − d) / (u − d)   — risk-neutral probability with dividend yield q<br><br>
+  Backward induction (American):<br>
+  V_j = max(intrinsic_j, e^{−rΔt} × [p · V_{j+1} + (1−p) · V_j])
+</div>
+<p>N = 50 steps. All pricing uses American exercise exclusively — European pricing is never used because the Wheel trades American-style equity options where early exercise matters, especially for puts on dividend-paying stocks.</p>
+
+<h3>5.2 Greeks (CHEME-5660 Weeks 11–12)</h3>
+<table>
+  <tr><th>Greek</th><th>Method</th><th>Formula</th></tr>
+  <tr><td><strong>Delta (Δ)</strong></td><td>CRR first level</td><td>Δ = (V_u − V_d) / (S·u − S·d)</td></tr>
+  <tr><td><strong>Gamma (Γ)</strong></td><td>Central finite diff</td><td>Γ = (V(S+ε) − 2V(S) + V(S−ε)) / ε²</td></tr>
+  <tr><td><strong>Theta (Θ)</strong></td><td>Forward diff</td><td>Θ = V(T − 1/365) − V(T)</td></tr>
+  <tr><td><strong>Vega (ν)</strong></td><td>Central finite diff</td><td>ν = (V(σ+0.01) − V(σ−0.01)) / 0.02</td></tr>
+</table>
+
+<h3>5.3 strike_from_delta — Bisection Search</h3>
+<div class="self-designed">⚠ SELF-DESIGNED — no course or textbook reference</div>
+<p>Input: target |Δ| (e.g., 0.25), current price S, σ, T.<br>
+Method: Binary search over K ∈ [0.5×S, 2.0×S]. At each midpoint, compute CRR delta. Converge when K_hi − K_lo &lt; $0.005.</p>
+
+<h3>5.4 estimate_implied_vol — Bisection on CRR</h3>
+<div class="self-designed">⚠ SELF-DESIGNED — CRR-based alternative to BSM IV solver</div>
+<p>Input: market option price, S, K, T.<br>
+Method: Binary search over σ ∈ [0.01, 3.0]. At each midpoint, price via CRR. Converge when σ_hi − σ_lo &lt; 1e-6.</p>
+
+<!-- Section 6: Engine -->
+<h1 id="engine">6. Backtest Engine / 回测引擎</h1>
+
+<h3>6.1 State Machine per Ticker</h3>
+<div class="formula">
+  SELLING_PUT → (put assigned: S &lt; K) → HOLDING_SHARES → (call assigned: S &gt; K) → SELLING_PUT
+</div>
+<p>Each ticker's Block B has 1–3 <strong>ladder slots</strong>, each running an independent Wheel cycle. This enables temporal diversification of expiry dates.</p>
+
+<h3>6.2 Daily Simulation Loop</h3>
+<table>
+  <tr><th>Step</th><th>Action</th><th>Reference</th></tr>
+  <tr><td>1</td><td>Deduct daily management fee (0.68% annual / 252)</td><td>PDF §5</td></tr>
+  <tr><td>2</td><td>Compute trailing VaR/ES → throttle if exceeded (VaR &gt; 2.5%, ES &gt; 3.5%)</td><td>PDF §4, §6</td></tr>
+  <tr><td>3</td><td>Compute drawdown_pct → feed into adaptive delta</td><td>PDF §3</td></tr>
+  <tr><td>4</td><td>Per ticker × slot: deduct borrow cost (0.5% annual on held shares)</td><td>PDF §7A</td></tr>
+  <tr><td>5</td><td>Check dividends → credit Block A + Block B held shares</td><td>PDF §2</td></tr>
+  <tr><td>6</td><td>Check option expiry → assignment (put ITM) or call-away (call ITM)</td><td>PDF §2</td></tr>
+  <tr><td>7</td><td>Check 4 roll triggers → roll if triggered</td><td>PDF §3</td></tr>
+  <tr><td>8</td><td>If no open option: check risk overlay, earnings, name/sector caps → open_option!</td><td>PDF §3–6</td></tr>
+  <tr><td>9</td><td>Check cost-basis repair (loss ≥ 10% → average down, max 2×/quarter)</td><td>PDF §6</td></tr>
+  <tr><td>10</td><td>Record DailyRecord: NAV, Cash, Shares, OptionMTM, Greeks, cumulative income/costs</td><td>—</td></tr>
+</table>
+
+<h3>6.3 Roll Triggers (4 Conditions)</h3>
+<ol>
+  <li><strong>Time-based:</strong> DTE in [3, 5] and option is OTM</li>
+  <li><strong>Premium decay:</strong> Current value / original premium &lt; 20% (80% captured)</li>
+  <li><strong>Moneyness band:</strong> |moneyness| &gt; ±5%</li>
+  <li><strong>Breakeven breach:</strong> Price beyond breakeven ± 2%</li>
+</ol>
+
+<h3>6.4 Adaptive Controls</h3>
+<table>
+  <tr><th>Control</th><th>Condition</th><th>Effect</th></tr>
+  <tr><td>Adaptive Tenor</td><td>σ &gt; 0.40 → shortest tenor; σ &lt; 0.15 → longest tenor</td><td>High vol = shorter expiry (more premium); Low vol = longer expiry (fewer costs)</td></tr>
+  <tr><td>Adaptive Delta</td><td>σ, near_earnings, drawdown → adjust t ∈ [0, 1] within delta range</td><td>High risk → lower delta (more OTM, safer)</td></tr>
+</table>
+
+<h3>6.5 Earnings Policy</h3>
+<table>
+  <tr><th>Policy</th><th>Behavior</th></tr>
+  <tr><td><code>:avoid</code></td><td>Skip opening new options within ±5 days of earnings</td></tr>
+  <tr><td><code>:widen</code></td><td>Open options but reduce delta by earnings_wider_delta (more OTM)</td></tr>
+  <tr><td><code>:reduce_size</code></td><td>Open options but reduce contracts to 50% (configurable)</td></tr>
+</table>
+
+<h3>6.6 Trading Cost Model</h3>
+<table>
+  <tr><th>Cost Component</th><th>Amount</th></tr>
+  <tr><td>Commission</td><td>$0.65 / contract</td></tr>
+  <tr><td>Exchange fee</td><td>$0.03 / contract</td></tr>
+  <tr><td>Clearing fee</td><td>$0.02 / contract</td></tr>
+  <tr><td>Bid-ask slippage</td><td>Volatility-adjusted spread model</td></tr>
+  <tr><td>Borrow fee</td><td>0.5% annual on held shares</td></tr>
+  <tr><td>Management fee</td><td>0.68% annual on NAV</td></tr>
+</table>
+
+<!-- Section 7: Monte Carlo -->
+<h1 id="mc">7. Monte Carlo & Stress Testing / 蒙特卡洛与压力测试</h1>
+
+<h3>7.1 Geometric Brownian Motion (CHEME-5660 Week 5b)</h3>
+<div class="formula">
+  S_{t+Δt} = S_t · exp[(μ − σ²/2)·Δt + σ·√Δt · Z],&nbsp;&nbsp; Z ~ N(0,1)
+</div>
+
+<h3>7.2 Correlated Multi-Asset GBM (CHEME-5660 Week 6)</h3>
+<div class="formula">
+  Z_corr = L · Z_indep,&nbsp;&nbsp; L = cholesky(ρ).L<br>
+  Each asset j: S_j(t+Δt) = S_j(t) · exp[(μ_j − σ_j²/2)·Δt + σ_j·√Δt · Z_corr_j]
+</div>
+
+<h3>7.3 Regime-Switching GBM</h3>
+<div class="self-designed">⚠ SELF-DESIGNED — motivated by Varner PDF §7B</div>
+<p>2-state Markov chain switching between normal (μ₁, σ₁) and stressed (μ₂, σ₂) regimes with transition probabilities p₁₂ and p₂₁.</p>
+
+<h3>7.4 Hidden Markov Model — 2-State (CHEME-5660 Week 13)</h3>
+<div class="formula">
+  EM (Baum-Welch) algorithm:<br>
+  E-step: Forward (α) and Backward (β) pass → responsibilities γ, transition counts ξ<br>
+  M-step: Update μ_k, σ²_k from weighted observations; update A from ξ<br>
+  Output: (μ_normal, σ_normal, μ_stressed, σ_stressed, p_to_stressed, p_to_normal)
+</div>
+
+<h3>7.5 Stress Scenarios</h3>
+<table>
+  <tr><th>Scenario</th><th>Vol Multiplier</th><th>Drift Adjustment</th><th>Gap</th></tr>
+  <tr><td>Normal (baseline)</td><td>1.0×</td><td>0</td><td>—</td></tr>
+  <tr><td>Vol Spike</td><td>2.0×</td><td>0</td><td>—</td></tr>
+  <tr><td>Bear Market</td><td>1.5×</td><td>−20%</td><td>—</td></tr>
+  <tr><td>Flash Crash</td><td>2.0×</td><td>0</td><td>−10% at day 30</td></tr>
+  <tr><td>Name Blowup</td><td>1.5×</td><td>0</td><td>−30% at day 60</td></tr>
+  <tr><td>Bull Squeeze</td><td>1.5×</td><td>+30%</td><td>+15% at day 45</td></tr>
+</table>
+
+<!-- Section 8: Charts -->
+<h1 id="charts">8. Results & Charts / 回测结果与图表</h1>
+
+<h3>Chart 1: NAV Curve vs SPY Benchmark</h3>
+<div class="chart-container">
+  <img src="data/nav_curve_2025.png" alt="NAV Curve 2025">
+  <div class="chart-caption">Daily NAV of Wheel Strategy vs SPY buy-and-hold benchmark. Dashed gray line = initial NAV ($600M).</div>
+</div>
+
+<h3>Chart 2: Drawdown from Peak</h3>
+<div class="chart-container">
+  <img src="data/drawdown_2025.png" alt="Drawdown 2025">
+  <div class="chart-caption">Drawdown from peak for Wheel Strategy (red) and SPY (orange dashed). Evaluates maximum drawdown depth and duration.</div>
+</div>
+
+<h3>Chart 3: Cumulative Income Decomposition</h3>
+<div class="chart-container">
+  <img src="data/income_decomposition_2025.png" alt="Income Decomposition 2025">
+  <div class="chart-caption">Cumulative premium (green) + dividends (blue) − trading costs (red dashed) = net income (black). Validates Distribution Yield KPI (PDF §4).</div>
+</div>
+
+<h3>Chart 4: Portfolio Greeks — Delta</h3>
+<div class="chart-container">
+  <img src="data/greeks_delta_2025.png" alt="Greeks Delta 2025">
+  <div class="chart-caption">Portfolio-level delta (shares equivalent). Higher delta = more directional long-equity exposure.</div>
+</div>
+
+<h3>Chart 5: Portfolio Greeks — Gamma</h3>
+<div class="chart-container">
+  <img src="data/greeks_gamma_2025.png" alt="Greeks Gamma 2025">
+  <div class="chart-caption">Portfolio gamma. Negative gamma is characteristic of short-option strategies (convexity risk).</div>
+</div>
+
+<h3>Chart 6: Portfolio Greeks — Vega</h3>
+<div class="chart-container">
+  <img src="data/greeks_vega_2025.png" alt="Greeks Vega 2025">
+  <div class="chart-caption">Portfolio vega. Negative vega = short volatility exposure (vol increase → P&amp;L loss).</div>
+</div>
+
+<h3>Chart 7: NAV Composition</h3>
+<div class="chart-container">
+  <img src="data/nav_composition_2025.png" alt="NAV Composition 2025">
+  <div class="chart-caption">NAV breakdown: Cash (green) vs Block A hold-shares (blue) vs Block B wheel-shares (orange).</div>
+</div>
+
+<h3>Chart 8: Daily Return Distribution</h3>
+<div class="chart-container">
+  <img src="data/return_distribution_2025.png" alt="Return Distribution 2025">
+  <div class="chart-caption">Histogram of daily log returns — Wheel (blue) vs SPY (orange). Red line = mean return.</div>
+</div>
+
+<h3>Chart 9: Rolling 60-Day Sharpe Ratio</h3>
+<div class="chart-container">
+  <img src="data/rolling_sharpe_2025.png" alt="Rolling Sharpe 2025">
+  <div class="chart-caption">Time-varying risk-adjusted return. Green dashed = Sharpe = 1.0 benchmark.</div>
+</div>
+
+<h3>Chart 10: Premium by Ticker (Top 15)</h3>
+<div class="chart-container">
+  <img src="data/premium_by_ticker_2025.png" alt="Premium by Ticker 2025">
+  <div class="chart-caption">Top 15 tickers by premium income. Blue = Safe sleeve, Orange = Aggressive sleeve.</div>
+</div>
+
+<h3>Chart 11: Short Option Mark-to-Market Liability</h3>
+<div class="chart-container">
+  <img src="data/option_mtm_2025.png" alt="Option MTM 2025">
+  <div class="chart-caption">Unrealized option liability over time. More negative = larger outstanding short option exposure.</div>
+</div>
+
+<h3>Chart 12: Monthly Returns</h3>
+<div class="chart-container">
+  <img src="data/monthly_returns_2025.png" alt="Monthly Returns 2025">
+  <div class="chart-caption">Monthly return bars — green = positive, red = negative.</div>
+</div>
+
+<!-- Section 9: Output Files -->
+<h1 id="outputs">9. Output Files / 输出文件说明</h1>
+
+<h3>CSV Data Files</h3>
+<table>
+  <tr><th>File</th><th>Columns</th><th>Purpose / 用途</th></tr>
+  <tr>
+    <td><code>daily_nav_2025.csv</code></td>
+    <td>Date, NAV, Cash, SharesValue, OptionMTM, BlockA_Value, CumPremium, CumDividends, CumCosts, Delta, Gamma, Vega, DailyReturn, SPY_NAV, SPY_Return, ExcessReturn</td>
+    <td>Day-level full dataset for any downstream analysis (Python/R/Excel). Foundation for all charts.</td>
+  </tr>
+  <tr>
+    <td><code>ticker_performance_2025.csv</code></td>
+    <td>Ticker, Sleeve, Sector, BlockA_Shares, Day1_Price, LastPrice, Premium, Dividends, Costs, Assigns, CallAways, Repairs, Trades, BlockA_PnL</td>
+    <td>Per-ticker attribution: which names contributed most premium, which were assigned/called-away most.</td>
+  </tr>
+</table>
+
+<h3>Chart Files (10 PNGs)</h3>
+<table>
+  <tr><th>#</th><th>File</th><th>Content</th><th>Analysis Purpose</th></tr>
+  <tr><td>1</td><td><code>nav_curve_2025.png</code></td><td>NAV vs SPY</td><td>Core performance — did the strategy beat the benchmark?</td></tr>
+  <tr><td>2</td><td><code>drawdown_2025.png</code></td><td>Drawdown from peak</td><td>Risk control — max drawdown depth &amp; recovery</td></tr>
+  <tr><td>3</td><td><code>income_decomposition_2025.png</code></td><td>Premium + Dividends − Costs</td><td>Income source decomposition, Distribution Yield validation</td></tr>
+  <tr><td>4–6</td><td><code>greeks_*.png</code></td><td>Portfolio Δ, Γ, ν</td><td>Directional risk, convexity risk, volatility risk monitoring</td></tr>
+  <tr><td>7</td><td><code>nav_composition_2025.png</code></td><td>Cash / Block A / Block B</td><td>Asset allocation visualization</td></tr>
+  <tr><td>8</td><td><code>return_distribution_2025.png</code></td><td>Daily return histogram</td><td>Return profile characterization</td></tr>
+  <tr><td>9</td><td><code>rolling_sharpe_2025.png</code></td><td>60-day rolling Sharpe</td><td>Time-varying risk-adjusted performance</td></tr>
+  <tr><td>10</td><td><code>premium_by_ticker_2025.png</code></td><td>Top 15 by premium</td><td>Per-name contribution attribution</td></tr>
+  <tr><td>11</td><td><code>option_mtm_2025.png</code></td><td>Option liability</td><td>Outstanding short option exposure</td></tr>
+  <tr><td>12</td><td><code>monthly_returns_2025.png</code></td><td>Monthly return bars</td><td>Monthly performance review</td></tr>
+</table>
+
+<!-- Section 10: Course Reference -->
+<h1 id="course">10. Course Reference Mapping / 课程对照表</h1>
+
+<table>
+  <tr><th>CHEME-5660 Week</th><th>Topic</th><th>Implementation in System</th></tr>
+  <tr><td>Week 5b</td><td>GBM / SAGBM parameter estimation</td><td><code>log_growth_matrix()</code>, <code>simulate_gbm()</code></td></tr>
+  <tr><td>Week 6</td><td>Multi-asset GBM + Cholesky decomposition</td><td><code>simulate_correlated_gbm()</code>, <code>compute_return_correlation()</code></td></tr>
+  <tr><td>Week 10</td><td>CRR Binomial Lattice — American Options</td><td><code>crr_price()</code> with dividend yield q</td></tr>
+  <tr><td>Week 11</td><td>Greeks (Δ, Γ, Θ, ν)</td><td><code>crr_delta/gamma/theta/vega()</code>, <code>option_greeks()</code></td></tr>
+  <tr><td>Week 12b</td><td>Delta and hedging</td><td><code>crr_delta()</code> → <code>strike_from_delta()</code></td></tr>
+  <tr><td>Week 13</td><td>HMM — Markov Models</td><td><code>fit_two_state_hmm()</code>, <code>classify_regime()</code></td></tr>
+</table>
+
+<h3>Self-Designed Components (⚠ Not from Course)</h3>
+<table>
+  <tr><th>Component</th><th>Description</th></tr>
+  <tr><td>IV Calibration (VRP Model)</td><td>σ_RV → σ_IV conversion via Variance Risk Premium + term + skew + volvol adjustments</td></tr>
+  <tr><td>strike_from_delta</td><td>Bisection search to find K producing target |Δ| under CRR</td></tr>
+  <tr><td>estimate_implied_vol</td><td>Bisection on CRR to find σ matching market price (American IV solver)</td></tr>
+  <tr><td>Bid-ask spread model</td><td>Volatility-adjusted half-spread estimation</td></tr>
+  <tr><td>Fill rate model</td><td>Spread-based fill rate with vol penalty</td></tr>
+  <tr><td>Regime-switching GBM</td><td>2-state Markov × GBM for regime-aware simulation</td></tr>
+  <tr><td>Earnings calendar estimation</td><td>SEC filing pattern-based quarterly date estimation</td></tr>
+  <tr><td>Cost-basis repair</td><td>Automated average-down when shares are ≥10% underwater</td></tr>
+  <tr><td>Adaptive tenor/delta</td><td>Vol-regime-aware selection of option tenor and delta target</td></tr>
+  <tr><td>Rolling IV computation</td><td>Convert time-series of σ_RV to σ_IV for all tickers</td></tr>
+</table>
+
+<!-- Section 11: Improvements -->
+<h1 id="improve">11. Improvements / 可提升方向</h1>
+
+<table>
+  <tr><th>Priority</th><th>Improvement</th><th>Current State</th><th>Method</th></tr>
+  <tr><td class="priority-high">HIGH</td><td>IS/OOS Split + Walk-Forward Validation</td><td>Only in-sample 2025 testing</td><td>Use 2014–2024 for param optimization, 2025 for OOS validation. PDF §7A explicitly requires this.</td></tr>
+  <tr><td class="priority-high">HIGH</td><td>Integrate HMM Regime into Backtest</td><td>HMM is implemented but not integrated into run_backtest!</td><td>Daily classify_regime() → :stressed → reduce delta / extend tenor / pause selling puts.</td></tr>
+  <tr><td class="priority-high">HIGH</td><td>Real IV Data</td><td>Using fixed VRP multipliers (1.15×/1.25×)</td><td>Connect to CBOE, OptionMetrics, or broker API for actual IV surfaces.</td></tr>
+  <tr><td class="priority-mid">MED</td><td>Multi-asset Correlated Stress Test</td><td>Stress tests are per-ticker or uniform</td><td>Use simulate_correlated_gbm() + industry correlations for joint stress.</td></tr>
+  <tr><td class="priority-mid">MED</td><td>Execution Realism</td><td>Assumes close-price execution</td><td>Use open/VWAP/next-day-open price for more realistic fill simulation.</td></tr>
+  <tr><td class="priority-mid">MED</td><td>Dynamic Rebalance</td><td>Weights fixed after initialization</td><td>Add monthly/quarterly rebalance of Block A/B proportions.</td></tr>
+  <tr><td class="priority-low">LOW</td><td>Stochastic Volatility (Heston)</td><td>Uses rolling realized vol</td><td>Replace simple GBM with Heston model for more accurate vol smile.</td></tr>
+  <tr><td class="priority-low">LOW</td><td>TWAP/VWAP Execution</td><td>Simple fixed slippage model</td><td>Connect real L2 data + optimal execution algorithms.</td></tr>
+  <tr><td class="priority-low">LOW</td><td>Live Broker API</td><td>Wheel Strategy Code is a template</td><td>Integrate Interactive Brokers TWS API (Julia IBApi.jl).</td></tr>
+</table>
+
+<h3>Varner PDF Requirements vs Implementation Status</h3>
+<table>
+  <tr><th>PDF Section</th><th>Requirement</th><th>Status</th></tr>
+  <tr><td>§2 Strategy</td><td>Wheel cycle: Short Put → Assigned → Covered Call → Called Away</td><td>✅ Complete</td></tr>
+  <tr><td>§3 Portfolio</td><td>Safe/Aggressive sleeves, 5% name cap, sector cap, laddering</td><td>✅ Complete</td></tr>
+  <tr><td>§4 KPIs</td><td>Distribution Yield, Premium Capture, Assignment Rate, Sharpe, VaR/ES</td><td>✅ Complete</td></tr>
+  <tr><td>§5 Operations</td><td>Commissions, exchange fees, borrow fees</td><td>✅ Complete</td></tr>
+  <tr><td>§6 Design Variables</td><td>Delta range, tenor, laddering, earnings policy, roll triggers, repair</td><td>✅ Complete</td></tr>
+  <tr><td>§7A Testing</td><td>IS/OOS split, walk-forward</td><td>⚠ Not Implemented</td></tr>
+  <tr><td>§7A Testing</td><td>Parameter sweep</td><td>✅ Implemented (RUN_PARAMETER_SWEEP flag)</td></tr>
+  <tr><td>§7B Stress</td><td>Regime-switching GBM, gap scenarios, vol spike</td><td>✅ Implemented (RUN_STRESS_TEST flag)</td></tr>
+  <tr><td>§7B Stress</td><td>IV surface calibration</td><td>⚠ Partial — VRP model, not real IV data</td></tr>
+</table>
+
+<hr>
+<p style="text-align:center; color:#718096; font-size:11px;">
+  Wheel Strategy ETF Fund — System Report | Cornell CHEME-5660 | Generated March 2026
+</p>
+
+</body>
+</html>

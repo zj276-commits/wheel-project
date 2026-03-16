@@ -9,14 +9,15 @@ function _to_float_vec(v)::Vector{Float64}
 end
 
 """
-    download_price_data(ticker, start_date, end_date) -> DataFrame
+    download_price_data(ticker, start_date, end_date; cache_year=2025) -> DataFrame
 
 Download daily OHLC price data from Yahoo Finance via YFinance.jl.
-Caches results to data/prices_2025/<TICKER>.csv to avoid repeated API calls.
+Caches results to data/prices_<year>/<TICKER>.csv to avoid repeated API calls.
 Returns a DataFrame with columns: date, open, high, low, close, adj_close, volume.
 """
-function download_price_data(ticker::String, start_date::Date, end_date::Date)::DataFrame
-    cache_dir = joinpath(_PATH_TO_DATA, "prices_2025")
+function download_price_data(ticker::String, start_date::Date, end_date::Date;
+                              cache_year::Int=2025)::DataFrame
+    cache_dir = joinpath(_PATH_TO_DATA, "prices_$(cache_year)")
     mkpath(cache_dir)
     cache_file = joinpath(cache_dir, "$(ticker).csv")
 
@@ -56,16 +57,17 @@ function download_price_data(ticker::String, start_date::Date, end_date::Date)::
 end
 
 """
-    download_all_prices(tickers, start_date, end_date) -> Dict{String, DataFrame}
+    download_all_prices(tickers, start_date, end_date; cache_year=2025) -> Dict{String, DataFrame}
 
 Download daily prices for all tickers. Shows progress and handles errors gracefully.
 """
-function download_all_prices(tickers::Vector{String}, start_date::Date, end_date::Date)::Dict{String, DataFrame}
+function download_all_prices(tickers::Vector{String}, start_date::Date, end_date::Date;
+                              cache_year::Int=2025)::Dict{String, DataFrame}
     result = Dict{String, DataFrame}()
     for (i, ticker) in enumerate(tickers)
         print("  [$i/$(length(tickers))] $ticker ... ")
         try
-            result[ticker] = download_price_data(ticker, start_date, end_date)
+            result[ticker] = download_price_data(ticker, start_date, end_date; cache_year=cache_year)
             println("$(nrow(result[ticker])) days")
         catch e
             @warn "Failed to download $ticker: $e"
@@ -75,13 +77,14 @@ function download_all_prices(tickers::Vector{String}, start_date::Date, end_date
 end
 
 """
-    download_dividends(ticker, start_date, end_date) -> DataFrame
+    download_dividends(ticker, start_date, end_date; cache_year=2025) -> DataFrame
 
 Download dividend payment data from Yahoo Finance.
 Returns DataFrame with columns: ex_date, amount.
 """
-function download_dividends(ticker::String, start_date::Date, end_date::Date)::DataFrame
-    cache_dir = joinpath(_PATH_TO_DATA, "dividends_2025")
+function download_dividends(ticker::String, start_date::Date, end_date::Date;
+                             cache_year::Int=2025)::DataFrame
+    cache_dir = joinpath(_PATH_TO_DATA, "dividends_$(cache_year)")
     mkpath(cache_dir)
     cache_file = joinpath(cache_dir, "$(ticker).csv")
 
@@ -111,15 +114,16 @@ function download_dividends(ticker::String, start_date::Date, end_date::Date)::D
 end
 
 """
-    download_all_dividends(tickers, start_date, end_date) -> Dict{String, DataFrame}
+    download_all_dividends(tickers, start_date, end_date; cache_year=2025) -> Dict{String, DataFrame}
 
 Download dividend data for all tickers.
 """
-function download_all_dividends(tickers::Vector{String}, start_date::Date, end_date::Date)::Dict{String, DataFrame}
+function download_all_dividends(tickers::Vector{String}, start_date::Date, end_date::Date;
+                                 cache_year::Int=2025)::Dict{String, DataFrame}
     result = Dict{String, DataFrame}()
     for ticker in tickers
         try
-            result[ticker] = download_dividends(ticker, start_date, end_date)
+            result[ticker] = download_dividends(ticker, start_date, end_date; cache_year=cache_year)
         catch e
             result[ticker] = DataFrame(ex_date = Date[], amount = Float64[])
         end
