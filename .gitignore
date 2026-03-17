@@ -31,3 +31,6 @@ JuliaLocalPreferences.toml
 Wheel_Strategy_Report_*.pdf
 report_*.html
 generate_report_pdf.py
+
+# WRDS OptionMetrics IV data (too large for GitHub, >800MB)
+data/wrds_iv_surface.csv

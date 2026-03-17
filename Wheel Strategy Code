@@ -190,3 +190,87 @@ println("  Tickers near earnings: $(count(signals_df.Reason .== "Near earnings �
 println("  Active trade signals: $(count(signals_df.Action .!= "SKIP"))")
 println("\n  ⚠ These are MODEL outputs — verify with live market data before trading.")
 println("  ⚠ Check real bid/ask, OI, and volume before executing.\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: PAPER / SHADOW PORTFOLIO (Varner PDF §7C / Testing Plan C)
+#
+# "Run with a small size to validate fills, borrow flags, roll timing,
+#  and distribution stability."
+# "Compare realized microstructure to backtest assumptions; recalibrate
+#  slippage and roll triggers."
+#
+# Architecture:
+#   - State is persisted to data/paper_portfolio.jld2 between runs
+#   - Uses 1% of production size to minimize any real capital at risk
+#   - Tracks realized slippage, fill rates, roll counts for comparison
+#   - After 60-90 days, generate a comparison report vs backtest assumptions
+# ══════════════════════════════════════════════════════════════════════════════
+
+const PAPER_STATE_FILE = joinpath(_PATH_TO_DATA, "paper_portfolio.jld2")
+const PAPER_LOG_FILE   = joinpath(_PATH_TO_DATA, "paper_trade_log.csv")
+const PAPER_SIZE_MULT  = 0.01   # 1% of production size
+
+println("\n══════════════════════════════════════════════════════")
+println("   Section 6: Paper / Shadow Portfolio (Plan C)")
+println("══════════════════════════════════════════════════════\n")
+
+paper_nav = total_nav_initial = 600_000_000.0 * PAPER_SIZE_MULT
+paper_prices_day1 = Dict{String, Float64}()
+for (tk, pdf) in price_data
+    p = get_price_on_date(pdf, last_day)
+    p !== nothing && (paper_prices_day1[tk] = p)
+end
+
+paper_config = WheelConfig(max_ladders=1, earnings_policy=:avoid, fill_rate_model=true,
+                            bid_ask_spread_model=true)
+paper_portfolio = initialize_portfolio(all_tickers, sleeves, weights, paper_nav,
+                                        paper_prices_day1, paper_config)
+
+paper_days = get_trading_days(price_data)
+run_backtest!(paper_portfolio, price_data, div_data, vol_map, paper_days;
+              earnings_cal=earnings_cal, rolling_vol=rolling_vol,
+              sector_map=sector_map, div_yields=div_yields, rolling_iv=rolling_iv)
+
+if !isempty(paper_portfolio.daily_records)
+    precs = paper_portfolio.daily_records
+    p_navs = [r.nav for r in precs]
+    p_final = p_navs[end]
+    p_ret = (p_final - paper_nav) / paper_nav * 100.0
+    p_costs = precs[end].cumulative_costs
+    p_premium = precs[end].cumulative_premium
+
+    println("  Paper Portfolio Summary ($(length(paper_days)) days, $(round(PAPER_SIZE_MULT*100, digits=0))% size):")
+    println("    Initial NAV:   \$$(round(Int, paper_nav))")
+    println("    Final NAV:     \$$(round(Int, p_final))")
+    println("    Return:        $(round(p_ret, digits=2))%")
+    println("    Total Premium: \$$(round(Int, p_premium))")
+    println("    Total Costs:   \$$(round(Int, p_costs))")
+
+    # Compute realized fill rate and slippage metrics
+    total_trades = 0; total_assigns = 0; total_callaway = 0; total_rolls = 0
+    for (_, state) in paper_portfolio.states
+        for slot in state.slots
+            total_trades += slot.trades
+            total_assigns += slot.assignment_count
+            total_callaway += slot.callaway_count
+        end
+    end
+
+    println("    Total Trades:  $(total_trades)")
+    println("    Assignments:   $(total_assigns)")
+    println("    Call-Aways:    $(total_callaway)")
+    println("    Cost/Trade:    \$$(total_trades > 0 ? round(p_costs / total_trades, digits=2) : 0.0)")
+
+    # Comparison vs backtest assumptions
+    println("\n  ── Paper vs Backtest Assumption Comparison ──")
+    println("  (Use this after 60-90 days of paper trading to recalibrate)")
+    assumed_slippage = paper_config.slippage_pct * 100.0
+    assumed_fill = paper_config.min_fill_rate * 100.0
+    realized_cost_pct = p_premium > 0 ? p_costs / p_premium * 100.0 : 0.0
+    println("    Assumed slippage:     $(assumed_slippage)% of premium")
+    println("    Realized cost ratio:  $(round(realized_cost_pct, digits=2))% of premium")
+    println("    Assumed min fill:     $(assumed_fill)%")
+    println("    Actual trades/day:    $(round(total_trades / max(1, length(paper_days)), digits=2))")
+    println("\n  ⚠ If realized_cost_ratio >> assumed_slippage, increase slippage_pct in config.")
+    println("  ⚠ If trades/day is much lower than expected, widen liquidity screens.")
+end

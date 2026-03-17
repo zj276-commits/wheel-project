@@ -1,6 +1,8 @@
 # Include.jl — Environment setup for the Wheel ETF Strategy project
-# Sets up directory paths, installs/loads Julia packages, and includes
-# local source modules in dependency order.
+#
+# Load order mirrors the PDF architecture:
+#   Foundation → PDF §3 (Portfolio) → PDF §5 (Ops/Costs) → PDF §4 (Risk)
+#   → PDF §7B (Simulation, incl. HMM) → PDF §7A (Backtest Engine)
 
 const _ROOT = @__DIR__;
 const _PATH_TO_SRC = joinpath(_ROOT, "src");
@@ -30,11 +32,27 @@ using HTTP
 using JSON3
 using YFinance
 
-# Source modules — order matters (dependencies must come first)
+# ── Source modules (dependency order) ─────────────────────────────────────────
+
+# 1. Foundation layer
 include(joinpath(_PATH_TO_SRC, "Files.jl"));
-include(joinpath(_PATH_TO_SRC, "Compute.jl"));
 include(joinpath(_PATH_TO_SRC, "DataDownload.jl"));
-include(joinpath(_PATH_TO_SRC, "OptionPricing.jl"));       # replaces BlackScholes.jl
-include(joinpath(_PATH_TO_SRC, "EarningsCalendar.jl"));     # earnings avoidance
-include(joinpath(_PATH_TO_SRC, "MonteCarloSim.jl"));        # GBM stress testing
+include(joinpath(_PATH_TO_SRC, "IVData.jl"));                # WRDS OptionMetrics IV surface
+include(joinpath(_PATH_TO_SRC, "Compute.jl"));                # rolling vol, trailing div yield, correlation
+include(joinpath(_PATH_TO_SRC, "OptionPricing.jl"));          # CRR, Greeks, strike_from_delta
+include(joinpath(_PATH_TO_SRC, "EarningsCalendar.jl"));       # earnings dates
+
+# 2. PDF Section 3 — Portfolio Construction
+include(joinpath(_PATH_TO_SRC, "PortfolioConstruction.jl"));
+
+# 3. PDF Section 5 — Operations & Costs
+include(joinpath(_PATH_TO_SRC, "OperationsCosts.jl"));
+
+# 4. PDF Section 4 — Risk & Compliance
+include(joinpath(_PATH_TO_SRC, "RiskCompliance.jl"));
+
+# 5. PDF Section 7B — Simulation (HMM via MyHiddenMarkovModel + GBM + stress)
+include(joinpath(_PATH_TO_SRC, "Simulation.jl"));
+
+# 6. PDF Section 7A — Backtest Engine (state machine + loop)
 include(joinpath(_PATH_TO_SRC, "WheelEngine.jl"));

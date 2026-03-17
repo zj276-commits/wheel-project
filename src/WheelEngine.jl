@@ -1,29 +1,24 @@
 """
-Wheel strategy backtest engine.
+Wheel Strategy Backtest Engine — Varner PDF Section 7A (Testing Plan A)
 
-Architecture: per-ticker state machine with ladder slots (Varner PDF Sections 2-6).
+Core state machine + daily simulation loop.
+
+Architecture: per-ticker state machine with ladder slots.
   SELLING_PUT → (assigned) → HOLDING_SHARES → (called away) → SELLING_PUT
 
 Each ticker maintains:
   Block A — buy-and-hold for dividends and capital appreciation (no options).
   Block B — split across 1–3 ladder slots, each running an independent Wheel cycle.
 
-Enhancements implemented (TODO items 2, 3, 5, 6, 7, 8, 12, 13, 17):
-  - CRR American option pricing with dividend yield q (OptionPricing.jl)
-  - Greeks: portfolio-level Δ, Γ, ν tracked daily
-  - Dynamic rolling volatility (Compute.jl)
-  - Earnings avoidance / delta widening (EarningsCalendar.jl)
-  - Laddering: multiple concurrent expiries per name (PDF §6)
-  - Bid-ask spread model + liquidity screens (PDF §3)
-  - Risk overlays: VaR/ES caps throttle new sales (PDF §4, §6)
-  - Partial fill model (PDF §7A)
-  - Extended cost model: exchange, clearing, borrow fees (PDF §5, §7A)
-  - US market holiday calendar for expiry dates (PDF §7A)
-  - Sector caps and per-name NAV ≤5% enforcement (PDF §3)
-  - Adaptive tenor selection based on vol regime (PDF §3)
-  - Adaptive delta within configurable range (PDF §3)
-  - Benchmark comparison in report (PDF §4)
+Dependencies (loaded before this file):
+  PortfolioConstruction.jl — WheelConfig, select_tenor, find_expiry, get_target_delta
+  OperationsCosts.jl       — apply_trade_costs!, apply_borrow_cost!, check_liquidity
+  RiskCompliance.jl        — compute_trailing_risk, check_name_weight, check_sector_cap
+  OptionPricing.jl         — option_price, option_greeks, strike_from_delta
+  Compute.jl               — trailing_dividend_yield
 """
+
+# ── Core Structs ──────────────────────────────────────────────────────────────
 
 @enum WheelPhase SELLING_PUT HOLDING_SHARES
 
@@ -35,9 +30,6 @@ mutable struct OptionPosition
     open_date::Date
 end
 
-"""
-Per Varner PDF Section 6 — "Laddering: number of concurrent expiries per name {1,2,3}."
-"""
 mutable struct LadderSlot
     id::Int
     phase::WheelPhase
@@ -66,54 +58,6 @@ mutable struct TickerState
     total_costs::Float64
 end
 
-Base.@kwdef struct WheelConfig
-    risk_free_rate::Float64 = 0.045
-    tenor_days::Vector{Int} = [7, 14, 30]
-    delta_put_safe::Tuple{Float64, Float64} = (0.20, 0.30)
-    delta_call_safe::Tuple{Float64, Float64} = (0.25, 0.35)
-    delta_put_aggr::Tuple{Float64, Float64} = (0.25, 0.35)
-    delta_call_aggr::Tuple{Float64, Float64} = (0.30, 0.40)
-    roll_dte_min::Int = 3
-    roll_dte_max::Int = 5
-    premium_decay_threshold::Float64 = 0.80
-    itm_otm_band_pct::Float64 = 0.05
-    breakeven_breach_pct::Float64 = 0.02
-    repair_loss_trigger::Float64 = 0.10
-    max_avg_down_pct::Float64 = 0.25
-    max_repairs_per_qtr::Int = 2
-    commission_per_contract::Float64 = 0.65
-    slippage_pct::Float64 = 0.02
-    mgmt_fee_annual::Float64 = 0.0068
-    max_ladders::Int = 1
-    earnings_buffer_days::Int = 5
-    earnings_policy::Symbol = :avoid       # :avoid, :widen, or :reduce_size
-    earnings_wider_delta::Float64 = 0.05
-    earnings_size_reduction::Float64 = 0.50 # reduce contracts to 50% near earnings
-    bid_ask_spread_model::Bool = true
-    crr_steps::Int = 50
-    # Extended cost model (PDF §5, §7A) — TODO item 6
-    exchange_fee_per_contract::Float64 = 0.03
-    clearing_fee_per_contract::Float64 = 0.02
-    borrow_fee_annual::Float64 = 0.005
-    # Liquidity screens (PDF §3, §6) — TODO item 2
-    min_open_interest::Int = 100
-    max_spread_width_pct::Float64 = 0.10
-    # Partial fill model (PDF §7A) — TODO item 5
-    fill_rate_model::Bool = true
-    min_fill_rate::Float64 = 0.5
-    # Risk overlays (PDF §4, §6) — TODO item 3
-    var_limit_daily::Float64 = 0.025
-    es_limit_daily::Float64 = 0.035
-    risk_lookback::Int = 20
-    # Position limits (PDF §3) — TODO item 8
-    max_name_weight::Float64 = 0.05
-    # Adaptive controls — TODO items 12, 13
-    adaptive_tenor::Bool = true
-    adaptive_delta::Bool = true
-    vol_high_threshold::Float64 = 0.40
-    vol_low_threshold::Float64 = 0.15
-end
-
 struct DailyRecord
     date::Date
     nav::Float64
@@ -137,202 +81,23 @@ mutable struct Portfolio
     config::WheelConfig
 end
 
-function default_config()::WheelConfig
-    return WheelConfig()
-end
-
-# ── US Market Holiday Calendar (TODO item 7) ──────────────────────────────────
-
-const US_MARKET_HOLIDAYS_2025 = Set{Date}([
-    Date(2025, 1, 1),   # New Year's Day
-    Date(2025, 1, 20),  # MLK Day
-    Date(2025, 2, 17),  # Presidents' Day
-    Date(2025, 4, 18),  # Good Friday
-    Date(2025, 5, 26),  # Memorial Day
-    Date(2025, 6, 19),  # Juneteenth
-    Date(2025, 7, 4),   # Independence Day
-    Date(2025, 9, 1),   # Labor Day
-    Date(2025, 11, 27), # Thanksgiving
-    Date(2025, 12, 25), # Christmas
-])
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-"""
-    select_tenor(config, date; σ=nothing) -> Int
-
-Select option tenor. When adaptive_tenor is enabled and vol is provided,
-prefer shorter tenors in high-vol environments (more annualized premium)
-and longer tenors in low-vol environments (fewer transaction costs).
-"""
-function select_tenor(config::WheelConfig, date::Date; σ::Union{Nothing, Float64}=nothing)::Int
-    if config.adaptive_tenor && σ !== nothing
-        if σ > config.vol_high_threshold
-            return minimum(config.tenor_days)
-        elseif σ < config.vol_low_threshold
-            return maximum(config.tenor_days)
-        end
-    end
-    idx = mod(Dates.week(date), length(config.tenor_days)) + 1
-    return config.tenor_days[idx]
-end
-
-"""
-    find_expiry(date, tenor_days) -> Date
-
-Round target date to next Friday, adjusting for US market holidays.
-If the computed Friday is a holiday, move to the preceding Thursday.
-"""
-function find_expiry(date::Date, tenor_days::Int)::Date
-    target = date + Day(tenor_days)
-    dow = dayofweek(target)
-    expiry = dow <= 5 ? target + Day(5 - dow) : target + Day(12 - dow)
-    while expiry in US_MARKET_HOLIDAYS_2025 || dayofweek(expiry) > 5
-        expiry -= Day(1)
-    end
-    return expiry
-end
-
-"""
-    get_target_delta(state, config, otype; σ=nothing, near_earn=false, drawdown_pct=0.0) -> Float64
-
-Compute target delta within the configured range. When adaptive_delta is enabled:
-  - High vol → use lower end of range (more OTM, safer)
-  - Near earnings → reduce delta further
-  - Large drawdown → use lower end of range (reduce risk)
-  - Low vol → use upper end of range (more ITM, higher premium)
-"""
-function get_target_delta(state::TickerState, config::WheelConfig, otype::Symbol;
-                           σ::Union{Nothing, Float64}=nothing,
-                           near_earn::Bool=false,
-                           drawdown_pct::Float64=0.0)::Float64
-    r = if state.sleeve == "Safe"
-        otype == :put ? config.delta_put_safe : config.delta_call_safe
-    else
-        otype == :put ? config.delta_put_aggr : config.delta_call_aggr
-    end
-
-    if !config.adaptive_delta || σ === nothing
-        return (r[1] + r[2]) / 2.0
-    end
-
-    t = 0.5
-    if σ > config.vol_high_threshold
-        t = max(0.0, 0.5 - (σ - config.vol_high_threshold) * 2.0)
-    elseif σ < config.vol_low_threshold
-        t = min(1.0, 0.5 + (config.vol_low_threshold - σ) * 2.0)
-    end
-    if near_earn
-        t = max(0.0, t - 0.2)
-    end
-    if drawdown_pct > 0.05
-        t = max(0.0, t - drawdown_pct)
-    end
-
-    return r[1] + t * (r[2] - r[1])
-end
-
-"""
-    estimate_half_spread(premium, σ) -> Float64
-
-Self-designed bid-ask half-spread model.
-Spread increases with underlying volatility.
-"""
-function estimate_half_spread(premium::Float64, σ::Float64)::Float64
-    base_spread = max(0.01, premium * 0.02)
-    vol_adjustment = 1.0 + max(0.0, σ - 0.30) * 2.0
-    return base_spread * vol_adjustment
-end
-
-"""
-    check_liquidity(premium, σ, config) -> (passes::Bool, fill_rate::Float64)
-
-Liquidity screening and fill rate estimation (TODO items 2, 5).
-Checks if estimated spread width exceeds max_spread_width_pct.
-Returns whether trade passes screen and the estimated fill rate.
-"""
-function check_liquidity(premium::Float64, σ::Float64,
-                          config::WheelConfig)::Tuple{Bool, Float64}
-    half_spread = estimate_half_spread(premium, σ)
-    full_spread = 2.0 * half_spread
-    spread_pct = premium > 0.01 ? full_spread / premium : 1.0
-
-    passes = spread_pct <= config.max_spread_width_pct
-
-    fill_rate = if config.fill_rate_model
-        base_fill = 1.0 - 0.3 * min(spread_pct / config.max_spread_width_pct, 1.0)
-        vol_penalty = σ > 0.50 ? 0.1 : 0.0
-        max(config.min_fill_rate, base_fill - vol_penalty)
-    else
-        1.0
-    end
-
-    return (passes, fill_rate)
-end
-
-"""
-    apply_trade_costs!(state, slot, premium, σ, config, portfolio)
-
-Deduct trading costs: commission + exchange fees + clearing fees + slippage.
-Extended cost model per Varner PDF Sections 5 and 7A (TODO item 6).
-"""
-function apply_trade_costs!(state::TickerState, slot::LadderSlot, premium::Float64,
-                            σ::Float64, config::WheelConfig, portfolio::Portfolio)
-    nc = slot.num_contracts
-    commission = config.commission_per_contract * nc
-    exchange_fee = config.exchange_fee_per_contract * nc
-    clearing_fee = config.clearing_fee_per_contract * nc
-    slippage = if config.bid_ask_spread_model
-        per_share_prem = abs(premium) / max(100 * nc, 1)
-        estimate_half_spread(per_share_prem, σ) * 100 * nc
-    else
-        abs(premium) * config.slippage_pct
-    end
-    cost = commission + exchange_fee + clearing_fee + slippage
-    state.total_costs += cost
-    portfolio.cash -= cost
-end
-
-"""
-    apply_borrow_cost!(state, slot, price, config, portfolio)
-
-Deduct daily borrow cost for held shares (TODO item 6).
-Per Varner PDF Section 7A: "borrow fees for hard-to-borrow events."
-"""
-function apply_borrow_cost!(state::TickerState, slot::LadderSlot, price::Float64,
-                            config::WheelConfig, portfolio::Portfolio)
-    slot.shares_held <= 0 && return
-    daily_borrow = config.borrow_fee_annual / 252.0 * slot.shares_held * price
-    state.total_costs += daily_borrow
-    portfolio.cash -= daily_borrow
-end
-
 # ── Option Operations ────────────────────────────────────────────────────────
 
-"""
-    open_option!(state, slot, price, date, σ, config, portfolio; ...) -> Float64
-
-Open a new option. Uses realized vol (σ) for delta targeting and implied vol
-(σ_iv) for premium pricing.
-
-σ_iv defaults to σ if not provided (backward compatible).
-"""
+"""Open a new option. Uses σ for delta targeting and σ_iv for pricing."""
 function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
                       date::Date, σ::Float64, config::WheelConfig,
                       portfolio::Portfolio;
                       earnings_cal=nothing, q::Float64=0.0,
                       near_earn::Bool=false, drawdown_pct::Float64=0.0,
-                      σ_iv::Float64=NaN)::Float64
+                      σ_iv::Float64=NaN, adv::Float64=0.0)::Float64
     pricing_vol = isnan(σ_iv) ? σ : σ_iv
 
     otype = slot.phase == SELLING_PUT ? :put : :call
     delta = get_target_delta(state, config, otype; σ=σ, near_earn=near_earn,
                               drawdown_pct=drawdown_pct)
 
-    if earnings_cal !== nothing && near_earn
-        if config.earnings_policy == :widen
-            delta = max(0.10, delta - config.earnings_wider_delta)
-        end
+    if earnings_cal !== nothing && near_earn && config.earnings_policy == :widen
+        delta = max(0.10, delta - config.earnings_wider_delta)
     end
 
     tenor = select_tenor(config, date; σ=σ)
@@ -344,9 +109,7 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
                             steps=config.crr_steps, q=q), 0.01)
 
     liq_ok, fill_rate = check_liquidity(prem, σ, config)
-    if !liq_ok
-        return 0.0
-    end
+    !liq_ok && return 0.0
 
     effective_contracts = if config.fill_rate_model && fill_rate < 1.0
         max(1, round(Int, slot.num_contracts * fill_rate))
@@ -354,10 +117,6 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
         slot.num_contracts
     end
 
-    # :reduce_size — trade through earnings but with fewer contracts
-    # Size = 50% of normal (configurable via earnings_size_reduction).
-    # Rationale: earnings vol crush makes selling options attractive,
-    # but gap risk is high, so reduce notional exposure.
     if earnings_cal !== nothing && near_earn && config.earnings_policy == :reduce_size
         effective_contracts = max(1, round(Int, effective_contracts * config.earnings_size_reduction))
     end
@@ -366,12 +125,11 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
     slot.trades += 1
     total = prem * 100 * effective_contracts
     slot.total_premium += total
-    apply_trade_costs!(state, slot, total, σ, config, portfolio)
+    apply_trade_costs!(state, slot, total, σ, config, portfolio; adv=adv)
     return total
 end
 
-"""Mark-to-market value of slot's open option using CRR American pricing.
-Uses σ_iv (implied vol) for MTM if provided, else falls back to σ (realized vol)."""
+"""Mark-to-market value of slot's open option using CRR American pricing."""
 function close_option_mtm(slot::LadderSlot, price::Float64, date::Date,
                           σ::Float64, config::WheelConfig;
                           q::Float64=0.0, σ_iv::Float64=NaN)::Float64
@@ -407,17 +165,14 @@ function handle_expiry!(state::TickerState, slot::LadderSlot, price::Float64,
     slot.option = nothing
 end
 
-# ── Roll Logic ───────────────────────────────────────────────────────────────
+# ── Roll Logic ────────────────────────────────────────────────────────────────
 
-"""
-Determine whether a slot's option should be rolled. Four triggers per Varner PDF §3.
-"""
+"""Four roll triggers per Varner PDF Section 3."""
 function should_roll(slot::LadderSlot, date::Date, price::Float64,
                      σ::Float64, config::WheelConfig)::Bool
     opt = slot.option
     opt === nothing && return false
     dte = Dates.value(opt.expiry - date)
-
     Dates.value(date - opt.open_date) < 3 && return false
 
     if config.roll_dte_min <= dte <= config.roll_dte_max
@@ -453,31 +208,27 @@ function should_roll(slot::LadderSlot, date::Date, price::Float64,
     return false
 end
 
-"""Close current option at market and open a new one (roll forward).
-Uses σ_iv for pricing if provided."""
+"""Close current option and open a new one (roll forward)."""
 function roll_option!(state::TickerState, slot::LadderSlot, price::Float64,
                       date::Date, σ::Float64, config::WheelConfig,
                       portfolio::Portfolio; earnings_cal=nothing, q::Float64=0.0,
                       near_earn::Bool=false, drawdown_pct::Float64=0.0,
-                      σ_iv::Float64=NaN)::Float64
+                      σ_iv::Float64=NaN, adv::Float64=0.0)::Float64
     cc = close_option_mtm(slot, price, date, σ, config; q=q, σ_iv=σ_iv)
     portfolio.cash -= cc
     slot.total_premium -= cc
-    apply_trade_costs!(state, slot, cc, σ, config, portfolio)
+    apply_trade_costs!(state, slot, cc, σ, config, portfolio; adv=adv)
     slot.option = nothing
     np = open_option!(state, slot, price, date, σ, config, portfolio;
                       earnings_cal=earnings_cal, q=q, near_earn=near_earn,
-                      drawdown_pct=drawdown_pct, σ_iv=σ_iv)
+                      drawdown_pct=drawdown_pct, σ_iv=σ_iv, adv=adv)
     portfolio.cash += np
     return np - cc
 end
 
-# ── Cost-Basis Repair ────────────────────────────────────────────────────────
+# ── Cost-Basis Repair ─────────────────────────────────────────────────────────
 
-"""
-Average down when shares are underwater beyond trigger %.
-Per Varner PDF Section 6.
-"""
+"""Average down when shares are underwater beyond trigger %."""
 function check_cost_basis_repair!(state::TickerState, slot::LadderSlot, date::Date,
                                   price::Float64, portfolio::Portfolio, config::WheelConfig)
     slot.phase != HOLDING_SHARES && return
@@ -507,7 +258,7 @@ function check_cost_basis_repair!(state::TickerState, slot::LadderSlot, date::Da
     slot.repairs_this_quarter += 1
 end
 
-# ── Dividends ────────────────────────────────────────────────────────────────
+# ── Dividends ─────────────────────────────────────────────────────────────────
 
 """Credit dividends for Block A + all slots' held shares."""
 function check_dividends!(state::TickerState, date::Date,
@@ -521,80 +272,8 @@ function check_dividends!(state::TickerState, date::Date,
     portfolio.cash += d
 end
 
-# ── Risk Overlay (TODO item 3) ───────────────────────────────────────────────
+# ── Portfolio Initialization ──────────────────────────────────────────────────
 
-"""
-    compute_trailing_risk(daily_records, lookback) -> (var95, es95)
-
-Compute trailing VaR and ES from daily NAV returns over a lookback window.
-Per Varner PDF Section 4: VaR and ES as core KPIs.
-Per Varner PDF Section 6: "Risk overlays: sleeve-level VaR/ES caps that throttle new sales."
-"""
-function compute_trailing_risk(daily_records::Vector{DailyRecord}, lookback::Int)
-    n = length(daily_records)
-    n < lookback + 1 && return (0.0, 0.0)
-
-    navs = [daily_records[i].nav for i in (n - lookback):n]
-    dr = diff(log.(navs))
-    length(dr) < 5 && return (0.0, 0.0)
-
-    srt = sort(dr)
-    vi = max(1, floor(Int, 0.05 * length(srt)))
-    var95 = -srt[vi]
-    es95 = vi > 0 ? -mean(srt[1:vi]) : 0.0
-
-    return (var95, es95)
-end
-
-# ── Name Weight Check (TODO item 8) ──────────────────────────────────────────
-
-"""
-    check_name_weight(state, price, nav, config) -> Bool
-
-Returns true if the ticker's exposure is within the per-name NAV cap.
-Per Varner PDF Section 3: "≤ 5% net asset value (NAV) per name."
-"""
-function check_name_weight(state::TickerState, price::Float64,
-                            nav::Float64, config::WheelConfig)::Bool
-    nav <= 0.0 && return true
-    total_shares = state.block_a_shares + sum(s.shares_held for s in state.slots)
-    exposure = total_shares * price
-    for slot in state.slots
-        exposure += slot.capital
-    end
-    return exposure / nav <= config.max_name_weight
-end
-
-"""
-    check_sector_cap(ticker, sector_map, portfolio, prices, nav; max_sector_weight=0.25) -> Bool
-
-Returns true if sector exposure is within cap.
-Per Varner PDF Section 3: "sector caps."
-"""
-function check_sector_cap(ticker::String, sector_map::Dict{String, String},
-                           portfolio::Portfolio, prices::Dict{String, Float64},
-                           nav::Float64; max_sector_weight::Float64=0.25)::Bool
-    nav <= 0.0 && return true
-    !haskey(sector_map, ticker) && return true
-    my_sector = sector_map[ticker]
-
-    sector_exposure = 0.0
-    for (tk, state) in portfolio.states
-        get(sector_map, tk, "") != my_sector && continue
-        p = get(prices, tk, NaN)
-        isnan(p) && continue
-        ts = state.block_a_shares + sum(s.shares_held for s in state.slots)
-        sector_exposure += ts * p
-    end
-
-    return sector_exposure / nav <= max_sector_weight
-end
-
-# ── Portfolio Initialization ─────────────────────────────────────────────────
-
-"""
-Initialize portfolio with Block A + Block B ladder slots per ticker.
-"""
 function initialize_portfolio(tickers::Vector{String}, sleeves::Vector{String},
                               weights::Vector{Float64}, initial_nav::Float64,
                               prices_day1::Dict{String, Float64},
@@ -615,23 +294,19 @@ function initialize_portfolio(tickers::Vector{String}, sleeves::Vector{String},
             push!(slots, LadderSlot(s, SELLING_PUT, 0, 0.0, nothing, nc, slot_capital,
                                      0.0, 0.0, 0, 0, 0, 0, 0, 0))
         end
-
         states[ticker] = TickerState(ticker, sleeves[i], ba, ba * price, slots, 0.0, 0.0)
     end
     return Portfolio(initial_nav - total_cost, initial_nav, states, DailyRecord[], config)
 end
 
-# ── NAV Computation ──────────────────────────────────────────────────────────
+# ── NAV Computation ───────────────────────────────────────────────────────────
 
-"""
-Compute daily NAV: cash + Block A equity + Block B equity + option MTM.
-Also computes portfolio-level Greeks. Uses rolling_iv for option MTM if available.
-"""
+"""Compute daily NAV and portfolio Greeks."""
 function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                      date::Date, vol_map::Dict{String, Float64},
                      config::WheelConfig;
                      rolling_vol=nothing, div_yields=nothing,
-                     rolling_iv=nothing)::DailyRecord
+                     div_data=nothing, rolling_iv=nothing)::DailyRecord
     sv, omtm, bav, tp, td, tc = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     p_delta, p_gamma, p_vega = 0.0, 0.0, 0.0
 
@@ -639,7 +314,13 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         p = get(prices, tk, NaN)
         isnan(p) && continue
         σ = _resolve_vol(rolling_vol, vol_map, tk, date)
-        q = div_yields !== nothing ? get(div_yields, tk, 0.0) : 0.0
+        q = if div_data !== nothing && haskey(div_data, tk)
+            trailing_dividend_yield(div_data[tk], p, date)
+        elseif div_yields !== nothing
+            get(div_yields, tk, 0.0)
+        else
+            0.0
+        end
         pricing_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
             get(rolling_iv[tk], date, σ)
         else
@@ -655,16 +336,14 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                                        pricing_vol, slot.option.type;
                                        steps=config.crr_steps, q=q)
                 omtm -= opt_val * 100.0 * slot.num_contracts
-
                 if T > 0.0
                     g = option_greeks(p, slot.option.strike, T, config.risk_free_rate,
                                       pricing_vol, slot.option.type;
                                       N=config.crr_steps, q=q)
-                    sign = -1.0
                     n = 100.0 * slot.num_contracts
-                    p_delta += sign * g.delta * n
-                    p_gamma += sign * g.gamma * n
-                    p_vega  += sign * g.vega  * n
+                    p_delta += -1.0 * g.delta * n
+                    p_gamma += -1.0 * g.gamma * n
+                    p_vega  += -1.0 * g.vega  * n
                 end
             end
             tp += slot.total_premium
@@ -678,7 +357,6 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                        p_delta, p_gamma, p_vega)
 end
 
-"""Resolve volatility: prefer rolling → static → fallback 0.25."""
 function _resolve_vol(rolling_vol, vol_map::Dict{String, Float64},
                       ticker::String, date::Date)::Float64
     if rolling_vol !== nothing && haskey(rolling_vol, ticker)
@@ -688,16 +366,13 @@ function _resolve_vol(rolling_vol, vol_map::Dict{String, Float64},
     return get(vol_map, ticker, 0.25)
 end
 
-# ── Main Simulation Loop ────────────────────────────────────────────────────
+# ── Main Simulation Loop ─────────────────────────────────────────────────────
 
 """
     run_backtest!(portfolio, price_data, div_data, vol_map, trading_days; ...)
 
-Day-by-day Wheel strategy simulation with risk overlays, name weight caps,
-sector caps, and IV calibration.
-
-rolling_iv — implied vol lookup Dict{String, Dict{Date, Float64}}.
-When provided, option pricing uses σ_IV while delta targeting uses σ_RV.
+Day-by-day Wheel strategy simulation with risk overlays, position limits,
+and IV calibration.
 """
 function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame},
                        div_data::Dict{String, DataFrame}, vol_map::Dict{String, Float64},
@@ -719,7 +394,6 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             portfolio.cash -= portfolio.daily_records[end].nav * dfee
         end
 
-        # Risk overlay: compute trailing VaR/ES and throttle if exceeded
         risk_throttled = false
         if length(portfolio.daily_records) > config.risk_lookback
             var95, es95 = compute_trailing_risk(portfolio.daily_records, config.risk_lookback)
@@ -732,7 +406,6 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             portfolio.initial_nav
         end
 
-        # Compute drawdown for adaptive delta
         drawdown_pct = 0.0
         if !isempty(portfolio.daily_records)
             pk = maximum(r.nav for r in portfolio.daily_records)
@@ -742,13 +415,22 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
         for (tk, state) in portfolio.states
             p = get(cp, tk, NaN); isnan(p) && continue
             σ = _resolve_vol(rolling_vol, vol_map, tk, date)
-            q = div_yields !== nothing ? get(div_yields, tk, 0.0) : 0.0
             ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
+            q = trailing_dividend_yield(ddf, p, date)
 
             σ_iv_val = if rolling_iv !== nothing && haskey(rolling_iv, tk)
                 get(rolling_iv[tk], date, NaN)
             else
                 NaN
+            end
+
+            pdf_tk = get(price_data, tk, nothing)
+            adv_val = 0.0
+            if pdf_tk !== nothing && hasproperty(pdf_tk, :volume)
+                idx = findfirst(==(date), pdf_tk.date)
+                if idx !== nothing && idx > 20
+                    adv_val = mean(Float64.(pdf_tk.volume[max(1,idx-20):idx])) * p
+                end
             end
 
             check_dividends!(state, date, ddf, portfolio)
@@ -767,14 +449,13 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                     roll_option!(state, slot, p, date, σ, config, portfolio;
                                  earnings_cal=earnings_cal, q=q,
                                  near_earn=is_near_earn, drawdown_pct=drawdown_pct,
-                                 σ_iv=σ_iv_val)
+                                 σ_iv=σ_iv_val, adv=adv_val)
                 end
 
                 if slot.option === nothing
                     skip = risk_throttled
                     skip = skip || (earnings_cal !== nothing &&
                                     config.earnings_policy == :avoid && is_near_earn)
-                    # :widen and :reduce_size pass through (handled inside open_option!)
                     skip = skip || !check_name_weight(state, p, current_nav, config)
                     if sector_map !== nothing
                         skip = skip || !check_sector_cap(tk, sector_map, portfolio, cp, current_nav)
@@ -785,7 +466,7 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                                                        portfolio; earnings_cal=earnings_cal,
                                                        q=q, near_earn=is_near_earn,
                                                        drawdown_pct=drawdown_pct,
-                                                       σ_iv=σ_iv_val)
+                                                       σ_iv=σ_iv_val, adv=adv_val)
                     end
                 end
 
@@ -795,17 +476,14 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
 
         push!(portfolio.daily_records, compute_nav(portfolio, cp, date, vol_map, config;
                                                     rolling_vol=rolling_vol,
-                                                    div_yields=div_yields,
+                                                    div_data=div_data,
                                                     rolling_iv=rolling_iv))
     end
 end
 
-# ── Report ───────────────────────────────────────────────────────────────────
+# ── Report ────────────────────────────────────────────────────────────────────
 
-"""
-Generate comprehensive performance report with KPIs from Varner PDF Section 4.
-Includes benchmark comparison (TODO item 17) and per-leg contribution.
-"""
+"""Generate comprehensive performance report with KPIs (Varner PDF Section 4)."""
 function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark_label::String="SPY")
     recs = portfolio.daily_records
     isempty(recs) && (println("No data."); return)
@@ -853,7 +531,6 @@ function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark
     sr = sum(sum(s.repair_count for s in st.slots) for (_, st) in portfolio.states if st.sleeve == "Safe")
     arr = sum(sum(s.repair_count for s in st.slots) for (_, st) in portfolio.states if st.sleeve == "Aggressive")
 
-    # Per-leg (put vs call) contribution
     put_prem, call_prem = 0.0, 0.0
     for (_, st) in portfolio.states
         for s in st.slots
@@ -866,9 +543,7 @@ function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark
         end
     end
 
-    println("\n══════════════════════════════════════════════════════")
-    println("         Wheel ETF Strategy — Performance Report")
-    println("══════════════════════════════════════════════════════")
+    println("\n--- Wheel ETF Strategy -- Performance Report ---\n")
 
     println("\n── Portfolio Summary ──")
     println("  Initial NAV:     \$$(round(Int, ini))")
@@ -902,7 +577,6 @@ function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark
     println("  Portfolio Gamma: $(round(last_rec.portfolio_gamma, digits=4))")
     println("  Portfolio Vega:  $(round(last_rec.portfolio_vega, digits=1))")
 
-    # Benchmark comparison (TODO item 17)
     if benchmark_navs !== nothing && length(benchmark_navs) >= length(navs)
         bm = benchmark_navs[1:length(navs)]
         bm_ret = (bm[end] - bm[1]) / bm[1] * 100.0
@@ -962,10 +636,10 @@ function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark
     println("  Max name weight:      $(Int(c.max_name_weight*100))% NAV")
     println("  Adaptive tenor:       $(c.adaptive_tenor)")
     println("  Adaptive delta:       $(c.adaptive_delta)")
-    println("  Time-based roll:      $(c.roll_dte_min)–$(c.roll_dte_max) DTE")
-    println("  Premium decay:        $(Int(c.premium_decay_threshold*100))% captured → roll")
-    println("  ITM/OTM band:         ±$(Int(c.itm_otm_band_pct*100))% moneyness → roll")
-    println("  Breakeven breach:     $(Int(c.breakeven_breach_pct*100))% past BE → roll")
+    println("  Time-based roll:      $(c.roll_dte_min)-$(c.roll_dte_max) DTE")
+    println("  Premium decay:        $(Int(c.premium_decay_threshold*100))% captured -> roll")
+    println("  ITM/OTM band:         +/-$(Int(c.itm_otm_band_pct*100))% moneyness -> roll")
+    println("  Breakeven breach:     $(Int(c.breakeven_breach_pct*100))% past BE -> roll")
     println("  Repair trigger:       $(Int(c.repair_loss_trigger*100))% underwater")
     println("  Max repair capital:   $(Int(c.max_avg_down_pct*100))% of slot capital")
     println("  Max repairs/quarter:  $(c.max_repairs_per_qtr)")

@@ -1,24 +1,23 @@
 """
 American option pricing via CRR (Cox-Ross-Rubinstein) binomial lattice.
 
-All pricing uses the American exercise model exclusively. The Wheel strategy
-trades American-style equity options where early exercise is possible and must
-be accounted for — particularly for short puts on dividend-paying stocks.
+Course equivalents (VLQuantitativeFinancePackage):
+  CRR tree:  build(MyBinomialEquityPriceTree, (u=u, d=d, p=p, μ=r)) |> populate(Sₒ, h)
+  Contract:  build(MyAmericanPutContractModel, (K=K, DTE=DTE, sense=1))
+  Price:     premium(contract, lattice)          — CHEME-5660 Week 10b
+  Greeks:    delta/gamma/theta/vega(contract, h=h, T=DTE, σ=σ, Sₒ=S, μ=r)  — Week 11
 
-Reference (CRR): CHEME-5660 Week 10 — "CRR Factors and American Derivatives Pricing"
-  Cox, Ross, Rubinstein (1979).
-  u = exp(σ√Δt), d = exp(-σ√Δt) = 1/u.
-  Risk-neutral probability: p = (exp((r-q)Δt) - d) / (u - d).
-  American value at each node: max(intrinsic, discounted continuation).
+We use a functional interface (crr_price, crr_delta, ...) instead of object
+construction because:
+  1. Continuous dividend yield q — the package's CRR does p = (exp(r·Δt)-d)/(u-d);
+     we extend to p = (exp((r-q)·Δt)-d)/(u-d) for dividend-paying stocks.
+  2. Performance — the backtest prices thousands of options per run; avoiding
+     object allocation per call is more efficient.
 
-Reference (Delta): CHEME-5660 Week 12b — "Delta and Vertical Call Spread"
-  Δ = (V_u - V_d) / (S·u - S·d).
-
-Enhancements (TODO items 4, 9, 1):
-  - Discrete dividend yield q in CRR lattice (proportional yield model)
-  - Greeks: Gamma, Theta, Vega via finite differences on CRR
-  - Implied volatility estimation via bisection on CRR price
-  - strike_from_delta: self-designed bisection (no course reference)
+The underlying math is identical to the course:
+  CRR (Week 10): u = exp(σ√Δt), d = 1/u, American = max(intrinsic, continuation)
+  Delta (Week 12b): Δ = (V_u - V_d) / (S·u - S·d)
+  Greeks (Week 11): Γ, Θ, ν via finite differences on CRR price
 """
 
 # ── CRR Binomial Lattice ─────────────────────────────────────────────────────

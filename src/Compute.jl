@@ -4,17 +4,17 @@ implied volatility calibration, and return correlation.
 
 log_growth_matrix: excess log return matrix for cross-sectional analysis.
   Reference: CHEME-5660 Week 5b — SAGBM parameter estimation.
+  VLQuantitativeFinancePackage exports a similar function; ours adapts the
+  column names to our Yahoo Finance data format (keycol=:adj_close).
 
 compute_rolling_volatility: time-varying σ for each ticker.
-  Self-designed (no direct course reference).
 
 compute_dividend_yields: annualized dividend yield per ticker.
   Used to pass q to CRR pricing for accurate American option valuation.
 
-calibrate_implied_vol: variance risk premium model to convert realized vol → implied vol.
+calibrate_implied_vol: VRP model to convert realized vol → implied vol.
+  Fallback when WRDS IV data is unavailable (see IVData.jl for primary source).
   Motivated by Varner PDF §7B: "calibrated to each name's IV surface."
-  Uses the well-documented volatility risk premium (IV > RV) with term structure
-  and moneyness (skew) adjustments.
 
 compute_return_correlation: pairwise correlation matrix for correlated MC.
   Reference: CHEME-5660 Week 6 — Multiple-Asset GBM with Cholesky decomposition.
@@ -76,13 +76,23 @@ function compute_rolling_volatility(price_data::Dict{String, DataFrame};
 end
 
 """
+    trailing_dividend_yield(div_df, current_price, date) -> Float64
+
+Compute trailing 12-month annualized dividend yield as of `date`.
+Only uses dividends with ex_date in [date-365, date] — NO forward look.
+"""
+function trailing_dividend_yield(div_df::DataFrame, current_price::Float64, date::Date)::Float64
+    current_price <= 0.0 && return 0.0
+    lookback = date - Day(365)
+    trailing = sum(row.amount for row in eachrow(div_df) if lookback <= row.ex_date <= date; init=0.0)
+    return trailing / current_price
+end
+
+"""
     compute_dividend_yields(div_data, price_data; lookback_years=1.0) -> Dict{String, Float64}
 
-Compute annualized continuous dividend yield q for each ticker.
-q = (total dividends over lookback) / (average price over lookback) / lookback_years
-
-Used to pass q to CRR pricing (TODO item 4) for correct American option valuation
-around ex-dividend dates.
+⚠ DEPRECATED — this function uses the FULL dataset (forward-looking).
+Kept for backward compatibility. Prefer trailing_dividend_yield() in the backtest loop.
 """
 function compute_dividend_yields(div_data::Dict{String, DataFrame},
                                   price_data::Dict{String, DataFrame};
@@ -279,3 +289,39 @@ function compute_rolling_iv(rolling_vol::Dict{String, Dict{Date, Float64}},
 
     return result
 end
+
+# ── Corporate Action Detection ───────────────────────────────────────────────
+
+"""
+    detect_stock_splits(price_data) -> Dict{String, Vector{NamedTuple}}
+
+Detect probable stock splits by comparing adj_close / close ratio changes.
+When the ratio shifts by > 10% between consecutive days, flag as a split.
+Returns a dictionary of tickers → list of (date, ratio) events.
+
+⚠ Heuristic — adj_close already corrects prices, but detecting splits lets us
+warn about periods where option pricing may be unreliable.
+"""
+function detect_stock_splits(price_data::Dict{String, DataFrame})
+    splits = Dict{String, Vector{NamedTuple{(:date, :ratio), Tuple{Date, Float64}}}}()
+    for (ticker, df) in price_data
+        nrow(df) < 2 && continue
+        events = NamedTuple{(:date, :ratio), Tuple{Date, Float64}}[]
+        for i in 2:nrow(df)
+            ratio_prev = df.adj_close[i-1] / max(df.close[i-1], 0.01)
+            ratio_curr = df.adj_close[i] / max(df.close[i], 0.01)
+            ratio_prev == 0.0 && continue
+            change = abs(ratio_curr / ratio_prev - 1.0)
+            if change > 0.10
+                split_ratio = round(ratio_prev / ratio_curr, digits=2)
+                push!(events, (date=df.date[i], ratio=split_ratio))
+            end
+        end
+        if !isempty(events)
+            splits[ticker] = events
+        end
+    end
+    return splits
+end
+
+# crowding_multiplier moved to OperationsCosts.jl
