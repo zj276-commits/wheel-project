@@ -1,90 +1,227 @@
 """
-Simulation — Varner PDF Section 7B (Testing Plan B)
+Simulation — HMM Regime Detection + GBM Path Simulation
 
 Contains:
-  1. HMM regime detection (CHEME-5660 Week 13) — uses MyHiddenMarkovModel
+  1. HMM regime detection — Student-t emissions, Baum-Welch EM, Viterbi decoding
+     (following Alswaidan & Varner, "A Hidden Markov Model for Modeling Equity")
   2. GBM path simulation (CHEME-5660 Week 5b)
   3. Regime-switching GBM, correlated multi-asset GBM (Cholesky, Week 6)
-  4. Earnings jump diffusion (Merton 1976)
+  4. Earnings jump diffusion with Poisson intensity (Merton 1976)
   5. Stress scenarios
 
-HMM approach follows L13a-Example-HMM-SPY-IS-Fall-2025.ipynb:
-  Discretize returns via CDF quantiles → count transitions → normalize → P̂.
-  Uses MyHiddenMarkovModel from VLQuantitativeFinancePackage.
+HMM approach per Alswaidan-Varner paper:
+  - K regimes (default K=3: bull/sideways/bear) with Student-t(ν=5) emissions
+  - Baum-Welch EM for parameter estimation (π, A, emission params)
+  - Viterbi algorithm for most-likely state sequence decoding
+  - Grid search over K ∈ {2,3,4} with BIC model selection
+  - Jump-diffusion overlay: Poisson(λ)-triggered jumps with LogNormal magnitude
 
 GBM formula:  S_{t+Δt} = S_t · exp[(μ - σ²/2)·Δt + σ·√Δt · Z],  Z ~ N(0,1)
-  Full path simulation (not just endpoint) for drawdown/stress analysis.
-  Course uses MyGeometricBrownianMotionEquityModel + sample_endpoint() for
-  terminal-only sampling; we extend to full paths here.
 """
 
-# ── HMM Regime Detection (CHEME-5660 Week 13) ────────────────────────────────
-# Follows L13a-Example-HMM-SPY-IS-Fall-2025.ipynb exactly:
-#   1. Fit Laplace distribution to returns
-#   2. CDF quantile boundaries → encode returns as discrete states
-#   3. Count transitions → normalize → probability matrix P̂
-#   4. build(MyHiddenMarkovModel, ...) from VLQuantitativeFinancePackage
-#   5. Per-state Normal decode distributions via fit_mle
+# ── HMM Regime Detection (Alswaidan-Varner) ─────────────────────────────────
+
+struct HMMRegimeModel
+    K::Int                          # number of regimes
+    π::Vector{Float64}              # initial state distribution
+    A::Matrix{Float64}              # K×K transition matrix
+    μ::Vector{Float64}              # emission means per regime
+    σ::Vector{Float64}              # emission stdevs per regime
+    ν::Float64                      # Student-t degrees of freedom
+    log_likelihood::Float64
+    bic::Float64
+    viterbi_path::Vector{Int}
+end
 
 """
-    build_hmm_model(returns; number_of_states=100) -> NamedTuple
-
-Build an HMM from return data (CHEME-5660 Week 13 approach).
-Returns: (model::MyHiddenMarkovModel, decode, encoded, bounds, P̂, states)
+Student-t log-pdf: log f(x | μ, σ, ν)
 """
-function build_hmm_model(returns::Vector{Float64}; number_of_states::Int=100)
-    length(returns) < 20 && error("Need at least 20 observations for HMM")
+function student_t_logpdf(x::Float64, μ::Float64, σ::Float64, ν::Float64)::Float64
+    z = (x - μ) / σ
+    return lgamma((ν + 1) / 2) - lgamma(ν / 2) - 0.5 * log(ν * π) - log(σ) -
+           ((ν + 1) / 2) * log(1 + z^2 / ν)
+end
 
-    states = collect(1:number_of_states)
-    E = diagm(ones(number_of_states))
+"""
+    baum_welch_em(returns, K; ν, max_iter, tol) -> HMMRegimeModel
 
-    d = fit_mle(Laplace, returns)
-    pct = range(0.0, stop=1.0, length=number_of_states + 1) |> collect
-    bounds = zeros(number_of_states, 2)
-    for s in states
-        bounds[s, 1] = quantile(d, max(pct[s], 1e-10))
-        bounds[s, 2] = quantile(d, min(pct[s+1], 1.0 - 1e-10))
+Baum-Welch EM algorithm with Student-t(ν) emissions.
+Per Alswaidan-Varner: uses scaled forward-backward to avoid underflow.
+"""
+function baum_welch_em(returns::Vector{Float64}, K::Int;
+                        ν::Float64=5.0, max_iter::Int=200, tol::Float64=1e-6)::HMMRegimeModel
+    T_len = length(returns)
+    T_len < 2 * K && error("Need at least $(2K) observations for $K-state HMM")
+
+    sorted_ret = sort(returns)
+    μ = [sorted_ret[max(1, round(Int, (2k-1) * T_len / (2K)))] for k in 1:K]
+    sort!(μ)
+    σ = fill(std(returns), K)
+    π_init = fill(1.0 / K, K)
+    A = fill(1.0 / K, K, K)
+    for k in 1:K
+        A[k, k] = max(0.8, 1.0 - 0.1 * (K - 1))
+        off_diag = (1.0 - A[k, k]) / max(K - 1, 1)
+        for j in 1:K
+            j != k && (A[k, j] = off_diag)
+        end
     end
 
-    encoded = Int[]
-    for val in returns
-        ci = 1
-        for s in states
-            if bounds[s, 1] <= val < bounds[s, 2]
-                ci = s; break
+    prev_ll = -Inf
+
+    for iter in 1:max_iter
+        # E-step: scaled forward-backward
+        log_B = Matrix{Float64}(undef, T_len, K)
+        for t in 1:T_len, k in 1:K
+            log_B[t, k] = student_t_logpdf(returns[t], μ[k], σ[k], ν)
+        end
+        B = exp.(log_B .- maximum(log_B, dims=2))
+
+        α = Matrix{Float64}(undef, T_len, K)
+        c = Vector{Float64}(undef, T_len)
+
+        α[1, :] .= π_init .* B[1, :]
+        c[1] = sum(α[1, :])
+        c[1] < 1e-300 && (c[1] = 1e-300)
+        α[1, :] ./= c[1]
+
+        for t in 2:T_len
+            for j in 1:K
+                α[t, j] = sum(α[t-1, i] * A[i, j] for i in 1:K) * B[t, j]
+            end
+            c[t] = sum(α[t, :])
+            c[t] < 1e-300 && (c[t] = 1e-300)
+            α[t, :] ./= c[t]
+        end
+
+        β = Matrix{Float64}(undef, T_len, K)
+        β[T_len, :] .= 1.0
+
+        for t in (T_len-1):-1:1
+            for i in 1:K
+                β[t, i] = sum(A[i, j] * B[t+1, j] * β[t+1, j] for j in 1:K)
+            end
+            s = sum(β[t, :])
+            s < 1e-300 && (s = 1e-300)
+            β[t, :] ./= s
+        end
+
+        γ = α .* β
+        for t in 1:T_len
+            s = sum(γ[t, :])
+            s < 1e-300 && (s = 1e-300)
+            γ[t, :] ./= s
+        end
+
+        ξ = Array{Float64, 3}(undef, T_len - 1, K, K)
+        for t in 1:(T_len-1)
+            denom = 0.0
+            for i in 1:K, j in 1:K
+                denom += α[t, i] * A[i, j] * B[t+1, j] * β[t+1, j]
+            end
+            denom < 1e-300 && (denom = 1e-300)
+            for i in 1:K, j in 1:K
+                ξ[t, i, j] = α[t, i] * A[i, j] * B[t+1, j] * β[t+1, j] / denom
             end
         end
-        push!(encoded, ci)
+
+        ll = sum(log.(c))
+
+        # M-step
+        π_init .= γ[1, :]
+        s_pi = sum(π_init)
+        s_pi > 0 && (π_init ./= s_pi)
+
+        for i in 1:K
+            γ_sum_1 = sum(γ[t, i] for t in 1:(T_len-1))
+            γ_sum_1 < 1e-300 && (γ_sum_1 = 1e-300)
+            for j in 1:K
+                A[i, j] = sum(ξ[t, i, j] for t in 1:(T_len-1)) / γ_sum_1
+            end
+            row_s = sum(A[i, :])
+            row_s > 0 && (A[i, :] ./= row_s)
+        end
+
+        for k in 1:K
+            γ_sum = sum(γ[t, k] for t in 1:T_len)
+            γ_sum < 1e-300 && (γ_sum = 1e-300)
+
+            w = (ν + 1) ./ (ν .+ ((returns .- μ[k]) ./ σ[k]) .^ 2)
+            wγ = [w[t] * γ[t, k] for t in 1:T_len]
+            denom = sum(wγ)
+            denom < 1e-300 && (denom = 1e-300)
+
+            μ[k] = sum(wγ[t] * returns[t] for t in 1:T_len) / denom
+            σ[k] = sqrt(sum(wγ[t] * (returns[t] - μ[k])^2 for t in 1:T_len) / γ_sum)
+            σ[k] = max(σ[k], 1e-8)
+        end
+
+        abs(ll - prev_ll) < tol && break
+        prev_ll = ll
     end
 
-    P = zeros(number_of_states, number_of_states)
-    for i in 2:length(encoded)
-        P[encoded[i-1], encoded[i]] += 1.0
+    # Viterbi decoding
+    log_δ = Matrix{Float64}(undef, T_len, K)
+    ψ = Matrix{Int}(undef, T_len, K)
+
+    for k in 1:K
+        log_δ[1, k] = log(max(π_init[k], 1e-300)) + student_t_logpdf(returns[1], μ[k], σ[k], ν)
     end
 
-    P̂ = zeros(number_of_states, number_of_states)
-    for row in states
-        Z = sum(P[row, :])
-        Z > 0 && (P̂[row, :] .= P[row, :] ./ Z)
-    end
-
-    decode = Dict{Int, Normal}()
-    for s in states
-        indices = findall(x -> x == s, encoded)
-        if length(indices) >= 2
-            decode[s] = fit_mle(Normal, returns[indices])
-        else
-            decode[s] = Normal(mean(returns), std(returns))
+    for t in 2:T_len
+        for j in 1:K
+            vals = [log_δ[t-1, i] + log(max(A[i, j], 1e-300)) for i in 1:K]
+            log_δ[t, j] = maximum(vals) + student_t_logpdf(returns[t], μ[j], σ[j], ν)
+            ψ[t, j] = argmax(vals)
         end
     end
 
-    model = build(MyHiddenMarkovModel, (
-        states = states,
-        T = P̂,
-        E = E
-    ))
+    path = Vector{Int}(undef, T_len)
+    path[T_len] = argmax(log_δ[T_len, :])
+    for t in (T_len-1):-1:1
+        path[t] = ψ[t+1, path[t+1]]
+    end
 
-    return (model=model, decode=decode, encoded=encoded, bounds=bounds, P̂=P̂, states=states)
+    ll_final = sum(log.(c) for c in [sum(α[end, :])])
+    ll_final = sum(log.(max.(c, 1e-300)) for c in [sum(α[t, :]) for t in 1:T_len])
+    n_params = K - 1 + K * (K - 1) + 2 * K
+    bic = -2 * prev_ll + n_params * log(T_len)
+
+    return HMMRegimeModel(K, copy(π_init), copy(A), copy(μ), copy(σ), ν,
+                          prev_ll, bic, path)
+end
+
+"""
+    fit_hmm_grid_search(returns; K_range, ν_range) -> HMMRegimeModel
+
+Grid search over number of states K and Student-t ν, selecting by BIC.
+Per Alswaidan-Varner: systematic search for optimal regime specification.
+"""
+function fit_hmm_grid_search(returns::Vector{Float64};
+                              K_range::Vector{Int}=[2, 3, 4],
+                              ν_range::Vector{Float64}=[3.0, 5.0, 7.0, 10.0])::HMMRegimeModel
+    best_model = nothing
+    best_bic = Inf
+
+    for K in K_range
+        length(returns) < 2 * K && continue
+        for ν in ν_range
+            try
+                model = baum_welch_em(returns, K; ν=ν)
+                if model.bic < best_bic
+                    best_bic = model.bic
+                    best_model = model
+                end
+            catch
+                continue
+            end
+        end
+    end
+
+    if best_model === nothing
+        return baum_welch_em(returns, 2; ν=5.0)
+    end
+    return best_model
 end
 
 """
@@ -101,22 +238,25 @@ function classify_regime(returns::Vector{Float64}; window::Int=20)::Symbol
 end
 
 """
-    fit_all_hmm(price_data, tickers; min_obs=60, number_of_states=100) -> Dict
+    fit_all_hmm(price_data, tickers; min_obs, K_range) -> Dict
 
-Build HMM for each ticker. Results can feed into extract_regime_params()
-and then into simulate_regime_gbm().
+Build HMM for each ticker via grid search (BIC selection).
+Returns Dict{ticker => HMMRegimeModel}.
 """
 function fit_all_hmm(price_data::Dict{String, DataFrame},
                       tickers::Vector{String};
-                      min_obs::Int=60, number_of_states::Int=100)::Dict{String, Any}
+                      min_obs::Int=60,
+                      K_range::Vector{Int}=[2, 3])::Dict{String, Any}
     results = Dict{String, Any}()
     for tk in tickers
         !haskey(price_data, tk) && continue
         df = price_data[tk]
         nrow(df) < min_obs + 1 && continue
         try
-            results[tk] = build_hmm_model(diff(log.(df.adj_close));
-                                           number_of_states=number_of_states)
+            log_ret = diff(log.(df.adj_close))
+            model = fit_hmm_grid_search(log_ret; K_range=K_range)
+            results[tk] = model
+            println("    $tk: K=$(model.K), ν=$(model.ν), BIC=$(round(model.bic, digits=1))")
         catch e
             @warn "HMM build failed for $tk: $e"
         end
@@ -125,13 +265,44 @@ function fit_all_hmm(price_data::Dict{String, DataFrame},
 end
 
 """
-    extract_regime_params(hmm_result) -> NamedTuple
+    extract_regime_params(hmm::HMMRegimeModel) -> NamedTuple
 
-Extract 2-regime (normal/stressed) parameters from an N-state HMM result.
-Lower-half states → stressed; upper-half → normal.
-Output can be passed directly to simulate_regime_gbm().
+Extract 2-regime (normal/stressed) parameters from an HMMRegimeModel.
+Regime with highest μ → normal; lowest μ → stressed.
 """
-function extract_regime_params(hmm_result)
+function extract_regime_params(hmm::HMMRegimeModel)
+    order = sortperm(hmm.μ)
+    stressed_idx = order[1]
+    normal_idx = order[end]
+
+    path = hmm.viterbi_path
+    n_s2n, n_s_total, n_n2s, n_n_total = 0.0, 0.0, 0.0, 0.0
+    for i in 2:length(path)
+        if path[i-1] == stressed_idx
+            n_s_total += 1
+            path[i] == normal_idx && (n_s2n += 1)
+        elseif path[i-1] == normal_idx
+            n_n_total += 1
+            path[i] == stressed_idx && (n_n2s += 1)
+        end
+    end
+
+    return (
+        μ_normal      = hmm.μ[normal_idx],
+        σ_normal      = max(hmm.σ[normal_idx], 1e-6),
+        μ_stressed    = hmm.μ[stressed_idx],
+        σ_stressed    = max(hmm.σ[stressed_idx], 1e-6),
+        p_to_stressed = clamp(n_n_total > 0 ? n_n2s / n_n_total : 0.05, 0.001, 0.5),
+        p_to_normal   = clamp(n_s_total > 0 ? n_s2n / n_s_total : 0.10, 0.001, 0.5),
+        K             = hmm.K,
+        bic           = hmm.bic,
+    )
+end
+
+"""
+Legacy compatibility wrapper — accepts old NamedTuple format from build_hmm_model.
+"""
+function extract_regime_params(hmm_result::NamedTuple)
     encoded = hmm_result.encoded
     decode = hmm_result.decode
     ns = length(hmm_result.states)
@@ -267,13 +438,16 @@ end
 """
     simulate_earnings_jump_gbm(...) -> Matrix{Float64}
 
-GBM + Merton-style jump at earnings dates + post-earnings vol crush.
-Per Varner PDF Section 7B: "earnings jumps, vol crush/expansion."
+GBM + Merton-style jump diffusion + post-earnings vol crush.
+Per Alswaidan-Varner: Poisson(λ)-triggered jumps with LogNormal magnitude.
+Earnings dates get deterministic jumps; between dates, random Poisson jumps
+capture non-earnings discontinuities (e.g., macro shocks, analyst downgrades).
 """
 function simulate_earnings_jump_gbm(S₀::Float64, μ::Float64, σ::Float64, T::Float64,
                                      earnings_days::Vector{Int};
                                      jump_mean::Float64=0.0, jump_std::Float64=0.07,
                                      vol_crush::Float64=0.60,
+                                     λ_jump::Float64=0.05,
                                      Δt::Float64=1.0/252.0, n_paths::Int=1000)::Matrix{Float64}
     n_steps = ceil(Int, T / Δt)
     paths = Matrix{Float64}(undef, n_steps + 1, n_paths)
@@ -287,14 +461,24 @@ function simulate_earnings_jump_gbm(S₀::Float64, μ::Float64, σ::Float64, T::
         end
     end
 
+    compensator = λ_jump * (exp(jump_mean + 0.5 * jump_std^2) - 1.0)
+
     for t in 2:(n_steps + 1)
         σ_t = (t - 1) in crush_steps ? σ * vol_crush : σ
-        drift = (μ - 0.5 * σ_t^2) * Δt
+        drift = (μ - 0.5 * σ_t^2 - compensator) * Δt
         diffusion = σ_t * sqrt(Δt)
 
         for p in 1:n_paths
-            jump = (t - 1) in earnings_set ? jump_mean + jump_std * randn() : 0.0
-            paths[t, p] = paths[t-1, p] * exp(drift + diffusion * randn() + jump)
+            n_jumps = rand(Poisson(λ_jump * Δt))
+            jump_component = 0.0
+            if (t - 1) in earnings_set
+                jump_component = jump_mean + jump_std * randn()
+            elseif n_jumps > 0
+                for _ in 1:n_jumps
+                    jump_component += jump_mean + jump_std * randn()
+                end
+            end
+            paths[t, p] = paths[t-1, p] * exp(drift + diffusion * randn() + jump_component)
         end
     end
     return paths
@@ -445,10 +629,52 @@ const EXTENDED_STRESS_SCENARIOS = [
     (label="Spread Widening (close micro.)", vol_mult=1.0, drift_adj=0.0,  gap_pct=0.0,  gap_day=0,  spread_w=4.0, liq_thin=0.5),
 ]
 
-# ── ROBUST SIMULATION (PDF Section 7B) ───────────────────────────────────────
-# TODO: Stochastic volatility model calibrated to IV surface
-# TODO: Overnight gap modeling
-# TODO: Full IV surface calibration per-name
-# TODO: Cross-asset contagion scenarios
-# Placeholder for future implementation — use WRDS IV data from IVData.jl
-# to calibrate per-name stochastic vol models here.
+# ── Heston-Aware Regime GBM ──────────────────────────────────────────────────
+
+"""
+    simulate_heston_regime_gbm(S₀, hmm, heston_params, T; Δt, n_paths)
+
+Regime-switching GBM where volatility comes from:
+  1. HMM regime state (bull/bear/sideways) → selects σ regime
+  2. Heston stochastic vol provides the per-step variance adjustment
+
+This combines the HMM regime detection with the Heston vol dynamics.
+"""
+function simulate_heston_regime_gbm(S₀::Float64,
+                                      regime_params::NamedTuple,
+                                      heston_params::HestonParams,
+                                      T::Float64;
+                                      Δt::Float64=1.0/252.0,
+                                      n_paths::Int=1000)::Matrix{Float64}
+    n_steps = ceil(Int, T / Δt)
+    paths = Matrix{Float64}(undef, n_steps + 1, n_paths)
+    paths[1, :] .= S₀
+
+    κ, θ, ξ, ρ = heston_params.kappa, heston_params.theta, heston_params.xi, heston_params.rho
+    p_ts = regime_params.p_to_stressed
+    p_tn = regime_params.p_to_normal
+
+    for p in 1:n_paths
+        stressed = false
+        v = heston_params.v0
+
+        for t in 2:(n_steps + 1)
+            stressed = stressed ? (rand() > p_tn) : (rand() < p_ts)
+            μ = stressed ? regime_params.μ_stressed : regime_params.μ_normal
+            σ_regime = stressed ? regime_params.σ_stressed : regime_params.σ_normal
+
+            Z1, Z2 = randn(), randn()
+            Zv = ρ * Z1 + sqrt(1 - ρ^2) * Z2
+
+            v_next = v + κ * (θ - v) * Δt + ξ * sqrt(max(v, 0.0) * Δt) * Zv
+            v = max(v_next, 1e-8)
+
+            σ_effective = 0.5 * σ_regime + 0.5 * sqrt(v)
+
+            drift = (μ - 0.5 * σ_effective^2) * Δt
+            diffusion = σ_effective * sqrt(Δt)
+            paths[t, p] = paths[t-1, p] * exp(drift + diffusion * Z1)
+        end
+    end
+    return paths
+end

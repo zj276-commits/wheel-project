@@ -353,6 +353,17 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         tc += state.total_costs
     end
     nav = portfolio.cash + sv + bav + omtm
+
+    total_shares = sum(
+        st.block_a_shares + sum(s.shares_held for s in st.slots)
+        for (_, st) in portfolio.states; init=0.0
+    )
+    if total_shares > 0.0
+        p_delta /= total_shares
+        p_gamma /= total_shares
+        p_vega  /= total_shares
+    end
+
     return DailyRecord(date, nav, portfolio.cash, sv, omtm, bav, tp, td, tc,
                        p_delta, p_gamma, p_vega)
 end
@@ -573,9 +584,9 @@ function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark
 
     println("\n── Portfolio Greeks (final day) ──")
     last_rec = recs[end]
-    println("  Portfolio Delta: $(round(last_rec.portfolio_delta, digits=1))")
-    println("  Portfolio Gamma: $(round(last_rec.portfolio_gamma, digits=4))")
-    println("  Portfolio Vega:  $(round(last_rec.portfolio_vega, digits=1))")
+    println("  Portfolio Delta: $(round(last_rec.portfolio_delta, digits=4)) (per share, 1.0 = fully long)")
+    println("  Portfolio Gamma: $(round(last_rec.portfolio_gamma, digits=6)) (per share)")
+    println("  Portfolio Vega:  $(round(last_rec.portfolio_vega, digits=4)) (per share)")
 
     if benchmark_navs !== nothing && length(benchmark_navs) >= length(navs)
         bm = benchmark_navs[1:length(navs)]
