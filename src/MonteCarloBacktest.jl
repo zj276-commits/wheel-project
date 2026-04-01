@@ -15,7 +15,7 @@ function run_portfolio_stress_tests(;
         price_data, div_data, vol_map, vix_data,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         safe_tickers, aggressive_tickers,
         chart_defaults,
         heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}())
@@ -43,7 +43,7 @@ function run_portfolio_stress_tests(;
                                            r=0.045, heston_ts=heston_ts, vix_data=vix_data)
         run_backtest!(pf, stressed_prices, div_data, vol_map, stressed_days;
                       earnings_cal=earnings_cal, rolling_vol=stressed_rolling,
-                      sector_map=sector_map, div_yields=div_yields,
+                      sector_map=sector_map,
                       rolling_iv=stressed_iv,
                       heston_ts=heston_ts)
 
@@ -114,7 +114,7 @@ function run_robust_mc_simulation(;
         price_data, div_data, vol_map, vix_data,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         trading_days, daily_df,
         safe_tickers, aggressive_tickers,
         chart_defaults, yr::String,
@@ -214,7 +214,7 @@ function run_robust_mc_simulation(;
         pf = initialize_portfolio(valid_tks, mc_sl, mc_w, initial_nav, synth_p1, config)
         run_backtest!(pf, synth_prices, div_data, vol_map, synth_trading_days;
                       earnings_cal=earnings_cal, rolling_vol=synth_rolling_vol,
-                      sector_map=sector_map, div_yields=div_yields,
+                      sector_map=sector_map,
                       rolling_iv=synth_iv,
                       heston_ts=heston_ts)
 

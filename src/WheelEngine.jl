@@ -335,7 +335,7 @@ end
 function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                      date::Date, vol_map::Dict{String, Float64},
                      config::WheelConfig;
-                     rolling_vol=nothing, div_yields=nothing,
+                     rolling_vol=nothing,
                      div_data=nothing, rolling_iv=nothing,
                      heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
                      vix_regime::Dict{Date, Float64}=Dict{Date, Float64}())::DailyRecord
@@ -348,8 +348,6 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         σ_rv = _resolve_vol(rolling_vol, vol_map, tk, date)
         q = if div_data !== nothing && haskey(div_data, tk)
             trailing_dividend_yield(div_data[tk], p, date)
-        elseif div_yields !== nothing
-            get(div_yields, tk, 0.0)
         else
             0.0
         end
@@ -437,7 +435,7 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                        div_data::Dict{String, DataFrame}, vol_map::Dict{String, Float64},
                        trading_days::Vector{Date};
                        earnings_cal=nothing, rolling_vol=nothing,
-                       sector_map=nothing, div_yields=nothing,
+                       sector_map=nothing,
                        rolling_iv=nothing,
                        heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
                        vix_regime::Dict{Date, Float64}=Dict{Date, Float64}())

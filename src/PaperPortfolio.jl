@@ -19,7 +19,7 @@ function run_paper_portfolio_validation(;
         price_data, div_data, vol_map,
         all_tickers, sleeves, weights,
         initial_nav, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         rolling_vol, rolling_iv,
         trading_days, daily_df,
         portfolio,
@@ -55,7 +55,7 @@ function run_paper_portfolio_validation(;
 
     run_backtest!(paper_pf, price_data, div_data, vol_map, paper_days;
                   earnings_cal=earnings_cal, rolling_vol=rolling_vol,
-                  sector_map=sector_map, div_yields=div_yields,
+                  sector_map=sector_map,
                   rolling_iv=rolling_iv,
                   heston_ts=heston_ts, vix_regime=vix_regime)
 
