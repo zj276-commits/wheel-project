@@ -313,7 +313,7 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
     for (tk, state) in portfolio.states
         p = get(prices, tk, NaN)
         isnan(p) && continue
-        σ = _resolve_vol(rolling_vol, vol_map, tk, date)
+        σ_rv = _resolve_vol(rolling_vol, vol_map, tk, date)
         q = if div_data !== nothing && haskey(div_data, tk)
             trailing_dividend_yield(div_data[tk], p, date)
         elseif div_yields !== nothing
@@ -322,9 +322,9 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
             0.0
         end
         pricing_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
-            get(rolling_iv[tk], date, σ)
+            get(rolling_iv[tk], date, σ_rv)
         else
-            σ
+            σ_rv
         end
 
         bav += state.block_a_shares * p
@@ -353,6 +353,17 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         tc += state.total_costs
     end
     nav = portfolio.cash + sv + bav + omtm
+
+    total_shares = sum(
+        st.block_a_shares + sum(s.shares_held for s in st.slots)
+        for (_, st) in portfolio.states; init=0.0
+    )
+    if total_shares > 0.0
+        p_delta /= total_shares
+        p_gamma /= total_shares
+        p_vega  /= total_shares
+    end
+
     return DailyRecord(date, nav, portfolio.cash, sv, omtm, bav, tp, td, tc,
                        p_delta, p_gamma, p_vega)
 end
@@ -363,7 +374,8 @@ function _resolve_vol(rolling_vol, vol_map::Dict{String, Float64},
         rv = rolling_vol[ticker]
         haskey(rv, date) && return rv[date]
     end
-    return get(vol_map, ticker, 0.25)
+    haskey(vol_map, ticker) || error("No volatility data for $ticker on $date — check vol_map population")
+    return vol_map[ticker]
 end
 
 # ── Main Simulation Loop ─────────────────────────────────────────────────────
@@ -414,7 +426,7 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
 
         for (tk, state) in portfolio.states
             p = get(cp, tk, NaN); isnan(p) && continue
-            σ = _resolve_vol(rolling_vol, vol_map, tk, date)
+            σ_rv = _resolve_vol(rolling_vol, vol_map, tk, date)
             ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
             q = trailing_dividend_yield(ddf, p, date)
 
@@ -423,6 +435,10 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             else
                 NaN
             end
+
+            # Heston IV drives all option decisions (delta, strike, tenor, roll);
+            # RV is only a fallback when IV is unavailable.
+            σ = isnan(σ_iv_val) ? σ_rv : σ_iv_val
 
             pdf_tk = get(price_data, tk, nothing)
             adv_val = 0.0
@@ -573,9 +589,9 @@ function generate_report(portfolio::Portfolio; benchmark_navs=nothing, benchmark
 
     println("\n── Portfolio Greeks (final day) ──")
     last_rec = recs[end]
-    println("  Portfolio Delta: $(round(last_rec.portfolio_delta, digits=1))")
-    println("  Portfolio Gamma: $(round(last_rec.portfolio_gamma, digits=4))")
-    println("  Portfolio Vega:  $(round(last_rec.portfolio_vega, digits=1))")
+    println("  Portfolio Delta: $(round(last_rec.portfolio_delta, digits=4)) (per share, 1.0 = fully long)")
+    println("  Portfolio Gamma: $(round(last_rec.portfolio_gamma, digits=6)) (per share)")
+    println("  Portfolio Vega:  $(round(last_rec.portfolio_vega, digits=4)) (per share)")
 
     if benchmark_navs !== nothing && length(benchmark_navs) >= length(navs)
         bm = benchmark_navs[1:length(navs)]

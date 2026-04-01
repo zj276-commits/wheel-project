@@ -24,6 +24,7 @@ function compute_trailing_risk(daily_records, lookback::Int)
     n < lookback + 1 && return (0.0, 0.0)
 
     navs = [daily_records[i].nav for i in (n - lookback):n]
+    all(x -> x > 0.0, navs) || return (0.0, 0.0)
     dr = diff(log.(navs))
     length(dr) < 5 && return (0.0, 0.0)
 

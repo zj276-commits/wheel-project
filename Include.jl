@@ -30,16 +30,15 @@ using PrettyTables
 using StatsBase
 using HTTP
 using JSON3
-using YFinance
 
 # ── Source modules (dependency order) ─────────────────────────────────────────
 
 # 1. Foundation layer
 include(joinpath(_PATH_TO_SRC, "Files.jl"));
 include(joinpath(_PATH_TO_SRC, "DataDownload.jl"));
-include(joinpath(_PATH_TO_SRC, "IVData.jl"));                # WRDS OptionMetrics IV surface
 include(joinpath(_PATH_TO_SRC, "Compute.jl"));                # rolling vol, trailing div yield, correlation
 include(joinpath(_PATH_TO_SRC, "OptionPricing.jl"));          # CRR, Greeks, strike_from_delta
+include(joinpath(_PATH_TO_SRC, "IVData.jl"));                # Heston stochastic vol IV model (needs strike_from_delta)
 include(joinpath(_PATH_TO_SRC, "EarningsCalendar.jl"));       # earnings dates
 
 # 2. PDF Section 3 — Portfolio Construction
@@ -51,8 +50,12 @@ include(joinpath(_PATH_TO_SRC, "OperationsCosts.jl"));
 # 4. PDF Section 4 — Risk & Compliance
 include(joinpath(_PATH_TO_SRC, "RiskCompliance.jl"));
 
-# 5. PDF Section 7B — Simulation (HMM via MyHiddenMarkovModel + GBM + stress)
+# 5. PDF Section 7B — Simulation (HMM Alswaidan-Varner + Heston + GBM + stress)
 include(joinpath(_PATH_TO_SRC, "Simulation.jl"));
 
 # 6. PDF Section 7A — Backtest Engine (state machine + loop)
 include(joinpath(_PATH_TO_SRC, "WheelEngine.jl"));
+
+# 7. PDF Section 7B/7C — MC Orchestration + Paper Portfolio Validation
+include(joinpath(_PATH_TO_SRC, "MonteCarloBacktest.jl"));
+include(joinpath(_PATH_TO_SRC, "PaperPortfolio.jl"));

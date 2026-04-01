@@ -32,5 +32,14 @@ Wheel_Strategy_Report_*.pdf
 report_*.html
 generate_report_pdf.py
 
-# WRDS OptionMetrics IV data (too large for GitHub, >800MB)
+# WRDS OptionMetrics data (too large for GitHub)
 data/wrds_iv_surface.csv
+data/option_prices.csv
+
+# Price caches (data now from VLQuantitativeFinancePackage)
+data/prices_*/
+
+# Temporary scripts
+_precompile.jl
+_explore_*.jl
+_find_*.jl

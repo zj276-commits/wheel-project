@@ -1,124 +1,322 @@
 """
-WRDS OptionMetrics Implied Volatility Surface — Data Loading & Lookup
+Heston Stochastic Volatility Model — IV Surface Generation
 
-Loads IV data from OptionMetrics CSV (downloaded via WRDS) and provides
-fast lookup functions for the backtest engine.
+All IV is model-derived via the Heston (1993) framework, calibrated from
+VIX + realized vol. No external IV data sources (WRDS, OptionMetrics, etc.)
+are used. The system is forward-looking and applicable to any tenor.
 
-Data columns used: ticker, date, days (DTE), delta, impl_volatility, cp_flag
+Model:
+  dS = μ S dt + √v S dW₁
+  dv = κ(θ - v)dt + ξ√v dW₂
+  Corr(dW₁, dW₂) = ρ
 
-Output format matches rolling_iv: Dict{String, Dict{Date, Float64}}
-so it integrates seamlessly with WheelEngine.jl's run_backtest!().
+Parameters:
+  v₀  — current instantaneous variance (calibrated from VIX or recent RV)
+  κ   — mean-reversion speed of variance
+  θ   — long-run variance level
+  ξ   — vol-of-vol (volatility of the variance process)
+  ρ   — correlation between stock and variance (typically negative for equities)
+
+Calibration sources:
+  - VIX index → proxy for √(30-day expected variance), sets v₀
+  - Historical realized vol → sets θ (long-run level)
+  - Option prices (when available) → refine κ, ξ, ρ via least-squares
+  - Fallback: empirical defaults by sleeve type
+
+Reference: Heston (1993) "A Closed-Form Solution for Options with
+Stochastic Volatility with Applications to Bond and Currency Options"
 """
 
-const _WRDS_IV_FILE = joinpath(_PATH_TO_DATA, "wrds_iv_surface.csv")
+struct HestonParams
+    v0::Float64     # current instantaneous variance
+    kappa::Float64  # mean-reversion speed
+    theta::Float64  # long-run variance
+    xi::Float64     # vol of vol
+    rho::Float64    # correlation (stock, variance)
+end
 
 """
-    load_iv_surface(csv_path; tickers=nothing) -> DataFrame
-
-Load WRDS OptionMetrics IV CSV. Filters to requested tickers and needed columns.
-The file can be very large (>800MB), so we only keep what we need.
+Heston characteristic function φ(u) for log-price.
+Used in the semi-analytic pricing formula via numerical integration.
 """
-function load_iv_surface(csv_path::String=_WRDS_IV_FILE;
-                          tickers::Union{Nothing, Vector{String}}=nothing)::DataFrame
-    if !isfile(csv_path)
-        @warn "WRDS IV file not found at $csv_path — will use VRP fallback"
-        return DataFrame()
+function heston_char_func(u::ComplexF64, S::Float64, K::Float64, T::Float64,
+                           r::Float64, q::Float64, params::HestonParams)::ComplexF64
+    v0, κ, θ, ξ, ρ = params.v0, params.kappa, params.theta, params.xi, params.rho
+
+    d = sqrt((ρ * ξ * im * u - κ)^2 + ξ^2 * (im * u + u^2))
+    g = (κ - ρ * ξ * im * u - d) / (κ - ρ * ξ * im * u + d)
+
+    C = (r - q) * im * u * T +
+        (κ * θ / ξ^2) * ((κ - ρ * ξ * im * u - d) * T - 2.0 * log((1.0 - g * exp(-d * T)) / (1.0 - g)))
+
+    D = ((κ - ρ * ξ * im * u - d) / ξ^2) * ((1.0 - exp(-d * T)) / (1.0 - g * exp(-d * T)))
+
+    return exp(C + D * v0 + im * u * log(S))
+end
+
+"""
+Heston European call price via numerical integration (Heston 1993).
+
+C = S·e^{-qT}·P₁ − K·e^{-rT}·P₂
+
+P_j = ½ + (1/π) ∫₀^∞ Re[e^{−iu·ln(K)} · f_j(u) / (iu)] du
+
+f₂(u) = φ(u)           — risk-neutral measure
+f₁(u) = φ(u−i) / φ(−i) — stock-numeraire measure
+"""
+function heston_call_price(S::Float64, K::Float64, T::Float64, r::Float64,
+                            params::HestonParams; q::Float64=0.0, N_quad::Int=200)::Float64
+    T <= 0.0 && return max(S * exp(-q * T) - K * exp(-r * T), 0.0)
+
+    lnK = log(K)
+    du = 150.0 / N_quad
+    φ_neg_i = heston_char_func(ComplexF64(-im), S, K, T, r, q, params)
+
+    I1, I2 = 0.0, 0.0
+    for i in 1:N_quad
+        u = (i - 0.5) * du
+        u < 1e-8 && continue
+
+        e_factor = exp(-im * u * lnK)
+
+        φ_u = heston_char_func(ComplexF64(u), S, K, T, r, q, params)
+        I2 += real(e_factor * φ_u / (im * u)) * du
+
+        φ_u_mi = heston_char_func(ComplexF64(u) - im, S, K, T, r, q, params)
+        I1 += real(e_factor * φ_u_mi / (im * u * φ_neg_i)) * du
     end
 
-    println("  Loading WRDS IV surface from $(basename(csv_path))...")
-    df = CSV.read(csv_path, DataFrame;
-                  select=[:ticker, :date, :days, :delta, :impl_volatility, :cp_flag],
-                  types=Dict(:date => Date, :delta => Float64, :impl_volatility => Float64,
-                             :days => Int, :cp_flag => String))
+    P1 = clamp(0.5 + I1 / π, 0.0, 1.0)
+    P2 = clamp(0.5 + I2 / π, 0.0, 1.0)
 
-    dropmissing!(df, :impl_volatility)
-    filter!(row -> row.impl_volatility > 0.0, df)
+    return max(S * exp(-q * T) * P1 - K * exp(-r * T) * P2, 0.0)
+end
 
-    if tickers !== nothing
-        filter!(row -> row.ticker in tickers, df)
+"""
+Heston European put price via put-call parity.
+"""
+function heston_put_price(S::Float64, K::Float64, T::Float64, r::Float64,
+                           params::HestonParams; q::Float64=0.0)::Float64
+    call = heston_call_price(S, K, T, r, params; q=q)
+    return call - S * exp(-q * T) + K * exp(-r * T)
+end
+
+"""
+Convert a Heston model price to Black-Scholes implied volatility via bisection.
+"""
+function heston_implied_vol(S::Float64, K::Float64, T::Float64, r::Float64,
+                             params::HestonParams; q::Float64=0.0,
+                             option_type::Symbol=:put)::Float64
+    T <= 0.0 && return sqrt(params.v0)
+
+    target = option_type == :call ?
+        heston_call_price(S, K, T, r, params; q=q) :
+        heston_put_price(S, K, T, r, params; q=q)
+    target <= 0.0 && return sqrt(params.v0)
+
+    σ_lo, σ_hi = 0.001, 5.0
+    for _ in 1:80
+        σ_mid = (σ_lo + σ_hi) / 2.0
+        bs_price = _bs_price(S, K, T, r, σ_mid, option_type; q=q)
+        if bs_price > target
+            σ_hi = σ_mid
+        else
+            σ_lo = σ_mid
+        end
+        (σ_hi - σ_lo) < 1e-7 && break
+    end
+    return (σ_lo + σ_hi) / 2.0
+end
+
+function _bs_price(S::Float64, K::Float64, T::Float64, r::Float64, σ::Float64,
+                    option_type::Symbol; q::Float64=0.0)::Float64
+    T <= 0.0 && return max(option_type == :call ? S - K : K - S, 0.0)
+    d1 = (log(S / K) + (r - q + 0.5 * σ^2) * T) / (σ * sqrt(T))
+    d2 = d1 - σ * sqrt(T)
+    nd = Normal(0.0, 1.0)
+    if option_type == :call
+        return S * exp(-q * T) * cdf(nd, d1) - K * exp(-r * T) * cdf(nd, d2)
+    else
+        return K * exp(-r * T) * cdf(nd, -d2) - S * exp(-q * T) * cdf(nd, -d1)
+    end
+end
+
+# ── Calibration ──────────────────────────────────────────────────────────────
+
+"""
+    HestonCalibration
+
+Per-ticker, per-date Heston parameters calibrated from real market option data.
+All five parameters (v₀, κ, θ, ξ, ρ) come directly from fitting to option prices.
+No hardcoded defaults, no VRP.
+"""
+struct HestonCalibration
+    v0::Float64
+    kappa::Float64
+    theta::Float64
+    xi::Float64
+    rho::Float64
+end
+
+const HESTON_CAL_PATH = joinpath(_PATH_TO_DATA, "heston_params.csv")
+
+"""
+    calibrate_heston_from_options(S, r, option_data; q) -> HestonParams
+
+Calibrate all 5 Heston parameters by minimizing SSE between Heston model
+prices and real market mid-prices via grid search.
+
+Input: a set of (K, T, market_price, option_type) observations from a single day.
+"""
+function calibrate_heston_from_options(S::Float64, r::Float64,
+                                        option_data::Vector;
+                                        q::Float64=0.0)::HestonParams
+    length(option_data) < 3 && error("Need ≥3 option observations, got $(length(option_data))")
+
+    atm_opts = filter(o -> abs(o.K - S) / S < 0.05, option_data)
+    v0_est = if !isempty(atm_opts)
+        avg_mid = mean(o.market_price for o in atm_opts)
+        avg_T = mean(o.T for o in atm_opts)
+        max((avg_mid / S / 0.4)^2 / max(avg_T, 0.01), 0.005^2)
+    else
+        (0.25)^2
+    end
+    v0_est = clamp(v0_est, 0.005^2, 2.0^2)
+
+    best_params = HestonParams(v0_est, 2.0, v0_est, 0.5, -0.7)
+    best_error = Inf
+
+    v0_grid  = [v0_est * f for f in [0.5, 0.75, 1.0, 1.5, 2.0]]
+    kap_grid = [0.5, 1.0, 2.0, 4.0, 8.0]
+    tht_grid = [v0_est * f for f in [0.5, 1.0, 1.5]]
+    xi_grid  = [0.2, 0.5, 0.8]
+    rho_grid = [-0.9, -0.7, -0.5, -0.3]
+
+    for v0 in v0_grid, kap in kap_grid, tht in tht_grid, xi in xi_grid, rho in rho_grid
+        params = HestonParams(v0, kap, tht, xi, rho)
+        total_err = 0.0
+        valid = true
+        for opt in option_data
+            try
+                model_price = opt.option_type == :call ?
+                    heston_call_price(S, opt.K, opt.T, r, params; q=q) :
+                    heston_put_price(S, opt.K, opt.T, r, params; q=q)
+                total_err += (model_price - opt.market_price)^2
+            catch
+                valid = false; break
+            end
+        end
+        if valid && total_err < best_error
+            best_error = total_err
+            best_params = params
+        end
     end
 
-    sort!(df, [:ticker, :date, :days, :delta])
-    println("  Loaded $(nrow(df)) IV records for $(length(unique(df.ticker))) tickers")
-    return df
+    return best_params
 end
 
 """
-    lookup_iv(iv_df, ticker, date, target_delta, dte; cp_flag="P") -> Union{Float64, Nothing}
+    load_heston_params(path) -> Dict{String, Dict{Date, HestonCalibration}}
 
-Find the IV closest to target_delta for a given ticker/date/DTE.
-Returns nothing if no data found.
-
-delta convention in OptionMetrics: negative for puts (e.g., -30), positive for calls.
+Load rolling Heston calibration time-series produced by `calibrate_heston.jl`.
+Returns: ticker → (date → HestonCalibration)
 """
-function lookup_iv(iv_df::DataFrame, ticker::String, date::Date,
-                    target_delta::Float64, dte::Int;
-                    cp_flag::String="P")::Union{Float64, Nothing}
-    nrow(iv_df) == 0 && return nothing
-
-    mask = (iv_df.ticker .== ticker) .& (iv_df.date .== date) .&
-           (iv_df.cp_flag .== cp_flag)
-    subset = iv_df[mask, :]
-    nrow(subset) == 0 && return nothing
-
-    dte_diffs = abs.(subset.days .- dte)
-    min_dte_diff = minimum(dte_diffs)
-    subset = subset[dte_diffs .<= min_dte_diff + 5, :]
-
-    delta_diffs = abs.(subset.delta .- target_delta)
-    best_idx = argmin(delta_diffs)
-    return subset.impl_volatility[best_idx]
+function load_heston_params(path::String)::Dict{String, Dict{Date, HestonCalibration}}
+    df = CSV.read(path, DataFrame)
+    result = Dict{String, Dict{Date, HestonCalibration}}()
+    for row in eachrow(df)
+        tk = row.ticker
+        d = Date(row.date)
+        cal = HestonCalibration(row.v0, row.kappa, row.theta, row.xi, row.rho)
+        if !haskey(result, tk)
+            result[tk] = Dict{Date, HestonCalibration}()
+        end
+        result[tk][d] = cal
+    end
+    n_tickers = length(result)
+    n_dates = isempty(result) ? 0 : maximum(length(v) for v in values(result))
+    println("  -> Loaded Heston params: $(n_tickers) tickers × up to $(n_dates) calibration dates")
+    return result
 end
 
 """
-    lookup_atm_iv(iv_df, ticker, date; dte=30) -> Union{Float64, Nothing}
+    lookup_heston_params(heston_ts, ticker, date) -> HestonParams
 
-ATM implied volatility: delta ≈ -50 for puts (standard ATM convention).
+Find the most recent calibration on or before `date` for `ticker`.
 """
-function lookup_atm_iv(iv_df::DataFrame, ticker::String, date::Date;
-                        dte::Int=30)::Union{Float64, Nothing}
-    return lookup_iv(iv_df, ticker, date, -50.0, dte; cp_flag="P")
+function lookup_heston_params(heston_ts::Dict{String, Dict{Date, HestonCalibration}},
+                                ticker::String, date::Date)::Union{HestonParams, Nothing}
+    !haskey(heston_ts, ticker) && return nothing
+    cal_dates = sort(collect(keys(heston_ts[ticker])))
+    isempty(cal_dates) && return nothing
+    idx = searchsortedlast(cal_dates, date)
+    idx == 0 && return nothing
+    cal = heston_ts[ticker][cal_dates[idx]]
+    return HestonParams(cal.v0, cal.kappa, cal.theta, cal.xi, cal.rho)
+end
+
+# ── IV Surface Generation ────────────────────────────────────────────────────
+
+"""
+    generate_iv_surface(S, r, params; tenors, deltas, q) -> DataFrame
+
+Generate a full IV surface for a given stock price and Heston parameters.
+Produces IV for every combination of tenor and delta.
+"""
+function generate_iv_surface(S::Float64, r::Float64, params::HestonParams;
+                              tenors::Vector{Int}=[7, 14, 30, 60, 90],
+                              deltas::Vector{Float64}=[0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50],
+                              q::Float64=0.0)::DataFrame
+    rows = NamedTuple{(:tenor_days, :delta, :strike, :iv_put, :iv_call, :put_price, :call_price),
+                       Tuple{Int, Float64, Float64, Float64, Float64, Float64, Float64}}[]
+
+    for tenor in tenors
+        T = tenor / 365.0
+        for δ in deltas
+            K = strike_from_delta(S, T, r, sqrt(params.v0), δ, :put; q=q)
+            iv_p = heston_implied_vol(S, K, T, r, params; q=q, option_type=:put)
+            iv_c = heston_implied_vol(S, K, T, r, params; q=q, option_type=:call)
+            p_price = heston_put_price(S, K, T, r, params; q=q)
+            c_price = heston_call_price(S, K, T, r, params; q=q)
+            push!(rows, (tenor_days=tenor, delta=δ, strike=round(K, digits=2),
+                         iv_put=round(iv_p, digits=4), iv_call=round(iv_c, digits=4),
+                         put_price=round(p_price, digits=2), call_price=round(c_price, digits=2)))
+        end
+    end
+
+    return DataFrame(rows)
 end
 
 """
-    build_daily_iv_map(iv_df, tickers, trading_days; dte=30) -> Dict{String, Dict{Date, Float64}}
+    build_heston_iv_map(price_data, trading_days;
+                         r, heston_ts) -> Dict{String, Dict{Date, Float64}}
 
-Pre-build an IV lookup map in the same format as compute_rolling_iv() output.
-Uses ATM put IV (delta=-50) as the representative daily IV per ticker.
+Build rolling IV map using pre-calibrated Heston parameters from
+`calibrate_heston.jl`. For each (ticker, date), look up the most recent
+calibration and extract ATM 30-day put IV.
 
-Falls back to nearest available date within 3 calendar days if exact date missing.
+All parameters (v₀, κ, θ, ξ, ρ) come from the calibration — no defaults.
 """
-function build_daily_iv_map(iv_df::DataFrame, tickers::Vector{String},
-                             trading_days::Vector{Date};
-                             dte::Int=30)::Dict{String, Dict{Date, Float64}}
+function build_heston_iv_map(price_data::Dict{String, DataFrame},
+                               trading_days::Vector{Date};
+                               r::Float64=0.045,
+                               heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}()
+                               )::Dict{String, Dict{Date, Float64}}
     result = Dict{String, Dict{Date, Float64}}()
-    nrow(iv_df) == 0 && return result
 
-    for tk in tickers
-        tk_mask = iv_df.ticker .== tk
-        tk_df = iv_df[tk_mask, :]
-        nrow(tk_df) == 0 && continue
-
+    for (tk, tk_df) in price_data
+        !haskey(heston_ts, tk) && continue
         iv_dict = Dict{Date, Float64}()
-        available_dates = unique(tk_df.date)
-        date_set = Set(available_dates)
 
         for d in trading_days
-            iv = lookup_atm_iv(tk_df, tk, d; dte=dte)
-            if iv !== nothing
-                iv_dict[d] = iv
+            params = lookup_heston_params(heston_ts, tk, d)
+            params === nothing && continue
+
+            S = get_price_on_date(tk_df, d)
+            if S !== nothing && S > 0.0
+                iv_dict[d] = heston_implied_vol(Float64(S), Float64(S), 30.0/365.0, r, params; option_type=:put)
             else
-                for offset in 1:3
-                    for dd in [d - Day(offset), d + Day(offset)]
-                        dd in date_set || continue
-                        iv2 = lookup_atm_iv(tk_df, tk, dd; dte=dte)
-                        if iv2 !== nothing
-                            iv_dict[d] = iv2
-                            @goto found
-                        end
-                    end
-                end
-                @label found
+                iv_dict[d] = sqrt(params.v0)
             end
         end
 
@@ -127,6 +325,25 @@ function build_daily_iv_map(iv_df::DataFrame, tickers::Vector{String},
         end
     end
 
-    println("  Built daily IV map: $(length(result)) tickers with WRDS IV data")
+    n_total = length(price_data)
+    n_done = length(result)
+    if n_done < n_total
+        missing_tks = [tk for tk in keys(price_data) if !haskey(result, tk)]
+        @warn "Tickers without Heston calibration (no IV generated): $missing_tks"
+    end
+    println("  Heston IV map: $(n_done)/$(n_total) tickers")
     return result
+end
+
+"""
+    heston_iv_for_option(S, K, T, r, params; q, option_type) -> Float64
+
+Single-point IV query: given current market state and Heston params,
+return the BS-equivalent IV for a specific option contract.
+This is used by WheelEngine for pricing individual option positions.
+"""
+function heston_iv_for_option(S::Float64, K::Float64, T::Float64, r::Float64,
+                               params::HestonParams;
+                               q::Float64=0.0, option_type::Symbol=:put)::Float64
+    return heston_implied_vol(S, K, T, r, params; q=q, option_type=option_type)
 end

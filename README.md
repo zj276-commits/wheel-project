@@ -17,8 +17,8 @@ Portfolio split: 60% Safe sleeve (low-vol, high-dividend) / 40% Aggressive sleev
 |---------|---------------|-----------|
 | **American option pricing** | CRR binomial lattice (N=50) with dividend yield q | CHEME-5660 Week 10 |
 | **Greeks** | Δ, Γ, Θ, ν via finite differences on CRR lattice | CHEME-5660 Week 11 |
-| **IV surface** | WRDS OptionMetrics historical IV (VRP fallback) | WRDS + Self-designed |
-| **HMM regime detection** | N-state discrete HMM via CDF quantile discretization | CHEME-5660 Week 13 |
+| **IV surface** | Heston (1993) stochastic vol model, rolling calibration from real option prices | Heston (1993) + Self-designed |
+| **HMM regime detection** | Jump-HMM: Laplace partition, Student-t emissions, Poisson jump mechanism | JumpHMM.jl + CHEME-5660 Week 13 |
 | **GBM simulation** | Standard, regime-switching, correlated (Cholesky), earnings jump | CHEME-5660 Week 5–6 |
 | **Stress testing** | Name-specific gaps, vol spikes, liquidity thinning | Varner PDF §7B |
 | **Risk overlays** | VaR/ES throttle, per-name 5% cap, sector caps | Varner PDF §4 |
@@ -41,22 +41,26 @@ wheel-project-1/
 ├── Project.toml                       # Julia package dependencies
 ├── src/
 │   ├── Files.jl                       # JLD2/CSV data loading utilities
-│   ├── DataDownload.jl                # Yahoo Finance price/dividend download
-│   ├── IVData.jl                      # WRDS OptionMetrics IV surface loading & lookup
-│   ├── Compute.jl                     # Rolling vol, dividend yield, IV calibration (VRP)
+│   ├── DataDownload.jl                # VLQuantitativeFinancePackage data loading (with ticker alias)
+│   ├── IVData.jl                      # Heston stochastic vol model — IV surface generation
+│   ├── Compute.jl                     # Rolling vol, dividend yield
 │   ├── OptionPricing.jl               # CRR American pricing, Greeks, strike_from_delta
 │   ├── EarningsCalendar.jl            # Earnings date loading and proximity check
 │   ├── PortfolioConstruction.jl       # [PDF §3] WheelConfig, holidays, tenor, delta targeting
 │   ├── OperationsCosts.jl             # [PDF §5] Fees, slippage, borrow, liquidity screens
 │   ├── RiskCompliance.jl              # [PDF §4] VaR/ES, position limits, sector caps, KPIs
-│   ├── Simulation.jl                  # [PDF §7B] HMM, GBM variants, stress scenarios
-│   └── WheelEngine.jl                 # [PDF §7A] Core state machine + backtest loop
+│   ├── Simulation.jl                  # [PDF §7B] Jump-HMM, GBM variants, stress scenarios
+│   ├── WheelEngine.jl                 # [PDF §7A] Core state machine + backtest loop
+│   ├── MonteCarloBacktest.jl          # [PDF §7B] Stress tests + MC robust simulation
+│   └── PaperPortfolio.jl              # [PDF §7C] Paper/shadow portfolio validation
+├── calibrate_heston.jl                # Standalone rolling Heston parameter calibration
 └── data/
-    ├── wrds_iv_surface.csv            # WRDS OptionMetrics IV (local only, not in repo)
-    ├── SAGBM-Parameters-Fall-2025.csv # Static drift/vol per ticker (fallback)
+    ├── SAGBM-Parameters-Fall-2025.csv # Static drift/vol per ticker
     ├── finviz.csv                     # Finviz screener (div yield > 3%)
-    ├── prices_2025/                   # Cached daily OHLC per ticker
-    └── dividends_2025/               # Cached dividend data per ticker
+    ├── heston_params.csv              # Rolling Heston IV calibration results
+    ├── stress_test_YYYY.csv           # Stress test scenario results
+    ├── mc_results_YYYY.csv            # Monte Carlo robust simulation results
+    └── dividends_YYYY/               # Cached dividend data per ticker
 ```
 
 ## Quick Start
@@ -70,10 +74,17 @@ Change the backtest year at the top of `Backtest.jl`:
 const BACKTEST_YEAR = 2025   # change to 2024 for prior-year backtest
 ```
 
-Enable parameter sweep or stress testing:
+Enable additional analysis modes:
 ```julia
-const RUN_PARAMETER_SWEEP = true
-const RUN_STRESS_TEST     = true
+const RUN_STRESS_TEST     = true   # Portfolio-level stress scenarios
+const RUN_ROBUST_MC       = true   # Monte Carlo robust simulation (HMM + Heston)
+const RUN_PAPER_PORTFOLIO = true   # Paper/shadow portfolio validation
+const RUN_PARAMETER_SWEEP = true   # Grid search over strategy parameters
+```
+
+Run Heston IV calibration (optional, improves IV surface quality):
+```bash
+julia calibrate_heston.jl 20    # calibrate every 20 trading days
 ```
 
 ## Configuration
@@ -112,6 +123,10 @@ Each backtest generates 10 charts and 2 CSV files in `data/`:
 | `greeks_delta/gamma/vega_YYYY.png` | Portfolio-level Greeks over time |
 | `daily_nav_YYYY.csv` | Full daily NAV series |
 | `ticker_performance_YYYY.csv` | Per-ticker P&L breakdown |
+| `stress_test_YYYY.csv` | Stress test scenario results |
+| `mc_results_YYYY.csv` | Monte Carlo robust simulation results |
+| `mc_fan_chart_YYYY.png` | Monte Carlo fan chart |
+| `paper_portfolio_YYYY.png` | Paper portfolio validation chart |
 
 ## Annotations: Self-Designed vs Course Reference
 
@@ -121,11 +136,11 @@ Each backtest generates 10 charts and 2 CSV files in `data/`:
 - Delta-based strike selection — Week 12b
 - GBM path simulation — Week 5b
 - Correlated multi-asset GBM (Cholesky) — Week 6a
-- HMM regime detection (CDF quantile + `MyHiddenMarkovModel`) — Week 13
+- Jump-HMM regime detection (Laplace partition + Student-t + Poisson jumps) — Week 13
 
 **Self-designed components (per Varner PDF):**
-- Rolling volatility estimator and IV calibration (VRP model)
-- WRDS OptionMetrics IV surface integration
+- Heston stochastic volatility IV surface (rolling calibration from real option prices)
+- Rolling Heston parameter calibration pipeline (`calibrate_heston.jl`)
 - Bid-ask spread model with crowding-adjusted slippage
 - Earnings calendar and avoidance/widening logic
 - Ladder slot data structure and multi-slot state machine
@@ -137,12 +152,11 @@ Each backtest generates 10 charts and 2 CSV files in `data/`:
 ## Dependencies
 
 See `Project.toml`. Key packages:
-- `VLQuantitativeFinancePackage` — Varner Lab quantitative finance toolkit (HMM, lattice models)
-- `YFinance` — Yahoo Finance data download
-- `Distributions` — Laplace/Normal fitting for HMM, option pricing
+- `VLQuantitativeFinancePackage` — Varner Lab quantitative finance toolkit (data, lattice models)
+- `Distributions` — Laplace/Student-t fitting for Jump-HMM, option pricing
+- `StatsBase` — Statistical functions (kurtosis, autocorrelation) for HMM tuning
 - `DataFrames`, `CSV` — Data handling
 - `Plots`, `StatsPlots` — Visualization
-- `JLD2` — Binary data caching
 
 ## License
 

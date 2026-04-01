@@ -12,6 +12,8 @@ include(joinpath(@__DIR__, "Include.jl"));
 const BACKTEST_YEAR       = 2025          # ← change to 2024, 2023, etc.
 const RUN_PARAMETER_SWEEP = false
 const RUN_STRESS_TEST     = false
+const RUN_ROBUST_MC       = false        # §7B Monte Carlo robust simulation
+const RUN_PAPER_PORTFOLIO = false         # §7C Paper/shadow portfolio validation
 
 # ── Derived constants ────────────────────────────────────────────────────────
 const YR        = string(BACKTEST_YEAR)
@@ -26,34 +28,8 @@ println("--- Part 1: Universe Construction (Varner PDF §3) ---\n")
 # ── 1a: Load volatility data ────────────────────────────────────────────────
 
 sagbm_df = load_sagbm_parameters();
-
-has_market_data = isfile(joinpath(_PATH_TO_DATA,
-    "SP500-Daily-OHLC-1-3-$(YR)-to-11-18-$(YR).jld2"))
-
-if has_market_data
-    println("  Loading JLD2 market data for volatility estimation...")
-    original_dataset = MyTestingMarketDataSet() |> x -> x["dataset"];
-    maximum_number_trading_days = original_dataset["NVDL"] |> nrow;
-    dataset = let
-        d = Dict{String, DataFrame}();
-        for (ticker, data) in original_dataset
-            nrow(data) == maximum_number_trading_days && (d[ticker] = data)
-        end; d
-    end;
-    list_of_tickers = keys(dataset) |> collect |> sort;
-
-    growth_rate_array = log_growth_matrix(dataset, list_of_tickers,
-        Δt = 1/252, risk_free_rate = 0.0);
-    vols = std(growth_rate_array, dims=1) |> vec;
-    vol_df = DataFrame(ticker = list_of_tickers, volatility = vols);
-
-    println("  Log-growth matrix: $(size(growth_rate_array, 1)) days x $(size(growth_rate_array, 2)) tickers")
-    println("  Volatility range: [$(round(minimum(vols), digits=4)), $(round(maximum(vols), digits=4))]")
-    println("  Mean vol: $(round(mean(vols), digits=4)),  Median vol: $(round(median(vols), digits=4))\n")
-else
-    @warn "JLD2 market data not found -- using SAGBM precomputed volatility."
-    vol_df = select(sagbm_df, :ticker, :volatility);
-end
+vol_df = select(sagbm_df, :ticker, :volatility);
+println("  SAGBM volatility loaded: $(nrow(vol_df)) tickers")
 
 # ── 1b: Load dividend yield from Finviz ─────────────────────────────────────
 
@@ -187,9 +163,10 @@ vol_map = Dict{String, Float64}()
 for row in eachrow(sagbm_df)
     vol_map[row.ticker] = row.volatility
 end
+
 missing_vol = [t for t in all_tickers if !haskey(vol_map, t)]
 if !isempty(missing_vol)
-    @warn "Tickers missing from SAGBM (using default σ=0.25): $missing_vol"
+    println("  ⚠ Tickers missing from SAGBM: $missing_vol — will compute from downloaded prices")
 end
 
 # ── 2b: Download daily price & dividend data ────────────────────────────────
@@ -219,58 +196,70 @@ for (ticker, pdf) in price_data
     end
 end
 
-# ── 2d: Compute rolling volatility & dividend yields ────────────────────────
+# ── 2d: Fill missing vol_map entries from actual downloaded price data ────────
+for tk in all_tickers
+    haskey(vol_map, tk) && continue
+    haskey(price_data, tk) || continue
+    df = price_data[tk]
+    nrow(df) < 31 && continue
+    prices = df.adj_close
+    lr = log.(prices[2:end] ./ prices[1:end-1])
+    computed_vol = std(lr) * sqrt(252)
+    vol_map[tk] = computed_vol
+    println("  [computed from prices] $tk → σ = $(round(computed_vol, digits=4))")
+end
+still_missing = [t for t in all_tickers if !haskey(vol_map, t)]
+if !isempty(still_missing)
+    error("Cannot proceed: tickers with no volatility data and no price data: $still_missing")
+end
+
+# ── 2e: Compute rolling volatility & dividend yields ────────────────────────
 
 rolling_vol = compute_rolling_volatility(price_data; window=30);
 div_yields = compute_dividend_yields(div_data, price_data);
 
-# ── 2e: Implied volatility — WRDS OptionMetrics IV or VRP fallback ──────────
+# ── 2f: Load VXX (VIX proxy) for Heston calibration ───────────────────────
+
+vix_data = nothing
+try
+    vxx_raw = download_all_prices(["VXX"], start_date, end_date; cache_year=BACKTEST_YEAR)
+    if haskey(vxx_raw, "VXX") && nrow(vxx_raw["VXX"]) > 0
+        global vix_data = vxx_raw["VXX"]
+        println("  VXX data: $(nrow(vix_data)) days, range [$(round(minimum(vix_data.close), digits=1)), $(round(maximum(vix_data.close), digits=1))]")
+    end
+catch e
+    @warn "Could not load VXX: $e"
+end
+
+# ── 2f: Load Heston calibration (from calibrate_heston.jl) ────────────────
 
 sleeves_map = Dict{String, String}(
     all_tickers[i] => sleeves[i] for i in 1:length(all_tickers)
 )
 
-wrds_iv_path = joinpath(_PATH_TO_DATA, "wrds_iv_surface.csv")
-rolling_iv = Dict{String, Dict{Date, Float64}}()
-if isfile(wrds_iv_path)
-    println("  Loading WRDS IV surface...")
-    iv_surface = load_iv_surface(wrds_iv_path; tickers=all_tickers)
-    if nrow(iv_surface) > 0
-        rolling_iv = build_daily_iv_map(iv_surface, all_tickers, trading_days; dte=30)
-        println("  WRDS IV: $(length(rolling_iv)) tickers with market IV data")
-    end
-    missing_iv = [t for t in all_tickers if !haskey(rolling_iv, t)]
-    if !isempty(missing_iv)
-        println("  Filling $(length(missing_iv)) tickers with VRP model fallback...")
-        vrp_iv = compute_rolling_iv(rolling_vol, sleeves_map)
-        for tk in missing_iv
-            haskey(vrp_iv, tk) && (rolling_iv[tk] = vrp_iv[tk])
-        end
+heston_ts = Dict{String, Dict{Date, HestonCalibration}}()
+if isfile(HESTON_CAL_PATH)
+    heston_ts = load_heston_params(HESTON_CAL_PATH)
+    missing_cal = [t for t in all_tickers if !haskey(heston_ts, t)]
+    if !isempty(missing_cal)
+        @warn "Tickers without Heston calibration: $missing_cal"
     end
 else
-    println("  WRDS IV file not found -- using VRP model for all tickers")
-    rolling_iv = compute_rolling_iv(rolling_vol, sleeves_map)
-end
-println("  IV calibration: $(length(rolling_iv)) tickers total")
-
-# ── 2f: Download VIX for reference ─────────────────────────────────────────
-
-vix_data = nothing
-try
-    vix_raw = download_all_prices(["^VIX"], start_date, end_date; cache_year=BACKTEST_YEAR)
-    if haskey(vix_raw, "^VIX") && nrow(vix_raw["^VIX"]) > 0
-        global vix_data = vix_raw["^VIX"]
-        println("  VIX data: $(nrow(vix_data)) days, range [$(round(minimum(vix_data.close), digits=1)), $(round(maximum(vix_data.close), digits=1))]")
-    end
-catch e
-    @warn "Could not download VIX: $e"
+    @warn "heston_params.csv not found — Heston IV will be unavailable. Run `julia calibrate_heston.jl` to generate it."
 end
 
-# ── 2g: Load earnings calendar ──────────────────────────────────────────────
+# ── 2g: Implied volatility — Heston stochastic volatility model ───────────
+
+println("  Building Heston IV map from calibrated params...")
+rolling_iv = build_heston_iv_map(price_data, trading_days;
+                                   r=0.045, heston_ts=heston_ts)
+println("  Heston IV map: $(length(rolling_iv)) tickers total")
+
+# ── 2h: Load earnings calendar ──────────────────────────────────────────────
 
 earnings_cal = load_earnings_calendar(all_tickers; year=BACKTEST_YEAR);
 
-# ── 2h: Output — Rolling Volatility Summary ────────────────────────────────
+# ── 2i: Output — Rolling Volatility Summary ────────────────────────────────
 
 println("\n-- Rolling Volatility Summary (30-day window, last available date) --")
 vol_summary_df = DataFrame(
@@ -337,6 +326,18 @@ else
     println("  No stock splits detected in $(length(all_tickers)) tickers.\n")
 end
 
+# ── Filter out tickers with no price data ─────────────────────────────────────
+missing_tickers = [t for t in all_tickers if !haskey(prices_day1, t)]
+if !isempty(missing_tickers)
+    @warn "Excluding tickers with no price data: $missing_tickers"
+    valid_mask = [haskey(prices_day1, t) for t in all_tickers]
+    all_tickers = all_tickers[valid_mask]
+    sleeves     = sleeves[valid_mask]
+    weights     = weights[valid_mask]
+    weights    ./= sum(weights)
+    sleeves_map = Dict(all_tickers[i] => sleeves[i] for i in 1:length(all_tickers))
+end
+
 # PART 3: RUN BACKTEST
 
 println("\n--- Part 3: Running $(YR) Backtest ---\n")
@@ -385,7 +386,7 @@ end
 println("\n-- Daily NAV DataFrame (first 5 + last 5 days) --")
 pretty_table(vcat(first(daily_df[:, [:Date, :NAV, :Cash, :OptionMTM, :Delta, :DailyReturn]], 5),
                   last(daily_df[:, [:Date, :NAV, :Cash, :OptionMTM, :Delta, :DailyReturn]], 5)),
-    column_labels=["Date", "NAV", "Cash", "Opt MTM", "Delta", "Daily Ret"])
+column_labels=["Date", "NAV", "Cash", "Opt MTM", "Delta", "Daily Ret"])
 
 CSV.write(joinpath(_PATH_TO_DATA, "daily_nav_$(YR).csv"), daily_df)
 println("  -> Saved to data/daily_nav_$(YR).csv")
@@ -424,8 +425,7 @@ end
 sort!(ticker_perf_df, :Premium, rev=true)
 
 println("\n-- Per-Ticker Performance --")
-pretty_table(ticker_perf_df,
-    column_labels=["Ticker","Sleeve","Sector","BA Shares","Day1 \$","Last \$",
+pretty_table(ticker_perf_df,    column_labels=["Ticker","Sleeve","Sector","BA Shares","Day1 \$","Last \$",
                     "Premium","Divs","Costs","Assigns","CallAways","Repairs","Trades","BA P&L"])
 
 CSV.write(joinpath(_PATH_TO_DATA, "ticker_performance_$(YR).csv"), ticker_perf_df)
@@ -456,8 +456,7 @@ if nrow(daily_df) > 20
         ))
     end
     println("\n-- Monthly Return Summary ($(YR)) --")
-    pretty_table(monthly_df,
-        column_labels=["Month", "NAV Start(M\$)", "NAV End(M\$)", "Return(%)", "MaxDD(%)", "Premium(M\$)"])
+    pretty_table(monthly_df,        column_labels=["Month", "NAV Start(M\$)", "NAV End(M\$)", "Return(%)", "MaxDD(%)", "Premium(M\$)"])
 end
 
 # ── 4d: Sector Performance ─────────────────────────────────────────────────
@@ -472,127 +471,136 @@ sector_perf = combine(groupby(ticker_perf_df, :Sector),
 )
 sort!(sector_perf, :TotalPremium, rev=true)
 println("\n-- Sector Performance --")
-pretty_table(sector_perf,
-    column_labels=["Sector", "Premium", "Dividends", "Costs", "Assigns", "Trades", "Block A P&L"])
+pretty_table(sector_perf,    column_labels=["Sector", "Premium", "Dividends", "Costs", "Assigns", "Trades", "Block A P&L"])
 
-# ── 4e: Charts ──────────────────────────────────────────────────────────────
+# ── 4e: Charts — Academic style (Alswaidan-Varner paper) ─────────────────────
+# White background, thin gridlines, sans-serif titles, muted palette,
+# tight margins — matching figures in HMM-Modeling-Equity.pdf.
+
+const _CHART_DEFAULTS = (
+    background_color = :white,
+    foreground_color = :black,
+    grid = true,
+    gridalpha = 0.3,
+    gridlinewidth = 0.5,
+    framestyle = :box,
+    tickfontsize = 8,
+    guidefontsize = 10,
+    titlefontsize = 11,
+    legendfontsize = 8,
+    dpi = 200,
+    size = (960, 380),
+    left_margin = 12Plots.mm,
+    bottom_margin = 10Plots.mm,
+    top_margin = 5Plots.mm,
+    right_margin = 5Plots.mm,
+)
 
 if nrow(daily_df) > 5
     dates_plot = daily_df.Date
     navs_plot = daily_df.NAV
     plot_dir = _PATH_TO_DATA
 
-    # Chart 1: NAV Curve with Benchmark
-    p1 = plot(dates_plot, navs_plot ./ 1e6,
-        title = "Wheel Strategy -- $(YR) Daily NAV",
+    p1 = plot(dates_plot, navs_plot ./ 1e6;
+        _CHART_DEFAULTS...,
+        title = "Figure 1: Portfolio NAV — Wheel Strategy vs SPY ($(YR))",
         xlabel = "Date", ylabel = "NAV (\$ millions)",
-        label = "Wheel Strategy", linewidth = 2, color = :steelblue,
-        size = (900, 400), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
-    hline!([initial_nav / 1e6], linestyle = :dash, color = :gray, label = "Initial NAV")
+        label = "Wheel Strategy", linewidth = 2, color = RGB(0.2, 0.4, 0.7))
+    hline!([initial_nav / 1e6], linestyle = :dash, color = :gray60, label = "Initial NAV", linewidth = 1)
     if benchmark_navs !== nothing && length(benchmark_navs) >= nrow(daily_df)
         plot!(dates_plot, benchmark_navs[1:nrow(daily_df)] ./ 1e6,
-              label = "SPY Buy-and-Hold", linewidth = 1.5, color = :orange, linestyle = :dash)
+              label = "SPY (Buy-and-Hold)", linewidth = 1.5, color = RGB(0.85, 0.45, 0.15), linestyle = :dash)
     end
     savefig(p1, joinpath(plot_dir, "nav_curve_$(YR).png"))
     display(p1)
 
-    # Chart 2: Drawdown Curve
     peak_nav = accumulate(max, navs_plot)
     drawdown_pct = (peak_nav .- navs_plot) ./ peak_nav .* 100.0
 
-    p2 = plot(dates_plot, -drawdown_pct,
-        title = "Drawdown from Peak ($(YR))",
+    p2 = plot(dates_plot, -drawdown_pct;
+        _CHART_DEFAULTS..., size = (960, 300),
+        title = "Figure 2: Drawdown from Peak ($(YR))",
         xlabel = "Date", ylabel = "Drawdown (%)",
-        label = "Wheel Strategy", linewidth = 1.5, color = :red,
-        fill = (0, 0.2, :red), size = (900, 300), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+        label = "Wheel Strategy", linewidth = 1.5, color = RGB(0.8, 0.15, 0.15),
+        fill = (0, 0.15, RGB(0.8, 0.15, 0.15)))
     if benchmark_navs !== nothing && length(benchmark_navs) >= nrow(daily_df)
         bm = benchmark_navs[1:nrow(daily_df)]
         bm_peak = accumulate(max, bm)
         bm_dd = (bm_peak .- bm) ./ bm_peak .* 100.0
-        plot!(dates_plot, -bm_dd, label = "SPY", linewidth = 1.0, color = :orange, linestyle = :dash)
+        plot!(dates_plot, -bm_dd, label = "SPY", linewidth = 1.0, color = RGB(0.85, 0.45, 0.15), linestyle = :dash)
     end
     savefig(p2, joinpath(plot_dir, "drawdown_$(YR).png"))
     display(p2)
 
-    # Chart 3: Cumulative Income (Premium + Dividends - Costs)
-    p3 = plot(dates_plot, daily_df.CumPremium ./ 1e6,
-        title = "Cumulative Income Decomposition ($(YR))",
+    p3 = plot(dates_plot, daily_df.CumPremium ./ 1e6;
+        _CHART_DEFAULTS...,
+        title = "Figure 3: Cumulative Income Decomposition ($(YR))",
         xlabel = "Date", ylabel = "\$ millions",
-        label = "Premium", linewidth = 2, color = :green,
-        size = (900, 400), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+        label = "Premium", linewidth = 2, color = RGB(0.2, 0.6, 0.3))
     plot!(dates_plot, daily_df.CumDividends ./ 1e6,
-        label = "Dividends", linewidth = 2, color = :blue)
+        label = "Dividends", linewidth = 2, color = RGB(0.2, 0.4, 0.7))
     plot!(dates_plot, daily_df.CumCosts ./ 1e6,
-        label = "Trading Costs", linewidth = 2, color = :red, linestyle = :dash)
+        label = "Trading Costs", linewidth = 1.5, color = RGB(0.8, 0.15, 0.15), linestyle = :dash)
     net_income = (daily_df.CumPremium .+ daily_df.CumDividends .- daily_df.CumCosts) ./ 1e6
     plot!(dates_plot, net_income,
         label = "Net Income", linewidth = 2.5, color = :black)
     savefig(p3, joinpath(plot_dir, "income_decomposition_$(YR).png"))
     display(p3)
 
-    # Chart 4: Portfolio Greeks -- Delta
-    p4a = plot(dates_plot, daily_df.Delta,
-        title = "Portfolio Greeks -- Delta ($(YR))",
-        xlabel = "Date", ylabel = "Delta (shares equivalent)",
-        label = "Portfolio Delta", linewidth = 1.5, color = :steelblue,
-        size = (900, 300), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+    p4a = plot(dates_plot, daily_df.Delta;
+        _CHART_DEFAULTS..., size = (960, 300),
+        title = "Figure 4a: Portfolio Delta ($(YR))",
+        xlabel = "Date", ylabel = "Delta (normalized, 1.0 = fully long)",
+        label = "Portfolio Δ", linewidth = 1.5, color = RGB(0.2, 0.4, 0.7))
+    hline!([0.0], linestyle = :dot, color = :gray50, label = nothing, linewidth = 0.8)
     savefig(p4a, joinpath(plot_dir, "greeks_delta_$(YR).png"))
     display(p4a)
 
-    # Chart 5: Portfolio Greeks -- Gamma
-    p4b = plot(dates_plot, daily_df.Gamma,
-        title = "Portfolio Greeks -- Gamma ($(YR))",
-        xlabel = "Date", ylabel = "Gamma",
-        label = "Portfolio Gamma", linewidth = 1.5, color = :purple,
-        size = (900, 300), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+    p4b = plot(dates_plot, daily_df.Gamma;
+        _CHART_DEFAULTS..., size = (960, 300),
+        title = "Figure 4b: Portfolio Gamma ($(YR))",
+        xlabel = "Date", ylabel = "Gamma (per share)",
+        label = "Portfolio Γ", linewidth = 1.5, color = RGB(0.55, 0.25, 0.65))
+    hline!([0.0], linestyle = :dot, color = :gray50, label = nothing, linewidth = 0.8)
     savefig(p4b, joinpath(plot_dir, "greeks_gamma_$(YR).png"))
     display(p4b)
 
-    # Chart 6: Portfolio Greeks -- Vega
-    p4c = plot(dates_plot, daily_df.Vega,
-        title = "Portfolio Greeks -- Vega ($(YR))",
-        xlabel = "Date", ylabel = "Vega",
-        label = "Portfolio Vega", linewidth = 1.5, color = :darkorange,
-        size = (900, 300), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+    p4c = plot(dates_plot, daily_df.Vega;
+        _CHART_DEFAULTS..., size = (960, 300),
+        title = "Figure 4c: Portfolio Vega ($(YR))",
+        xlabel = "Date", ylabel = "Vega (per share)",
+        label = "Portfolio ν", linewidth = 1.5, color = RGB(0.85, 0.45, 0.15))
+    hline!([0.0], linestyle = :dot, color = :gray50, label = nothing, linewidth = 0.8)
     savefig(p4c, joinpath(plot_dir, "greeks_vega_$(YR).png"))
     display(p4c)
 
-    # Chart 7: NAV Composition (Cash vs Shares vs Options)
     p5 = areaplot(dates_plot,
-        [daily_df.Cash ./ 1e6  daily_df.BlockA_Value ./ 1e6  daily_df.SharesValue ./ 1e6],
-        title = "NAV Composition Over Time ($(YR))",
+        [daily_df.Cash ./ 1e6  daily_df.BlockA_Value ./ 1e6  daily_df.SharesValue ./ 1e6];
+        _CHART_DEFAULTS...,
+        title = "Figure 5: NAV Composition ($(YR))",
         xlabel = "Date", ylabel = "\$ millions",
         label = ["Cash" "Block A (Hold)" "Block B (Shares)"],
-        color = [:lightgreen :steelblue :orange],
-        size = (900, 400), dpi = 150, alpha = 0.7,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+        color = [RGB(0.75, 0.88, 0.75) RGB(0.2, 0.4, 0.7) RGB(0.85, 0.45, 0.15)],
+        alpha = 0.7)
     savefig(p5, joinpath(plot_dir, "nav_composition_$(YR).png"))
     display(p5)
 
-    # Chart 8: Daily Returns Distribution
     dr = daily_df.DailyReturn[2:end] .* 100.0
-    p6 = histogram(dr,
-        title = "Daily Return Distribution ($(YR))",
+    p6 = histogram(dr;
+        _CHART_DEFAULTS...,
+        title = "Figure 6: Daily Return Distribution ($(YR))",
         xlabel = "Daily Return (%)", ylabel = "Frequency",
-        label = "Wheel Returns", bins = 50, color = :steelblue, alpha = 0.7,
-        size = (900, 400), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
-    vline!([mean(dr)], linewidth = 2, color = :red, label = "Mean=$(round(mean(dr), digits=3))%")
+        label = "Wheel Returns", bins = 60, color = RGB(0.2, 0.4, 0.7), alpha = 0.7)
+    vline!([mean(dr)], linewidth = 2, color = RGB(0.8, 0.15, 0.15),
+           label = "Mean = $(round(mean(dr), digits=3))%")
     vline!([0.0], linewidth = 1, color = :black, linestyle = :dash, label = nothing)
     if hasproperty(daily_df, :SPY_Return)
         spy_dr = daily_df.SPY_Return[2:end] .* 100.0
-        histogram!(spy_dr, bins = 50, color = :orange, alpha = 0.4, label = "SPY Returns")
+        histogram!(spy_dr, bins = 60, color = RGB(0.85, 0.45, 0.15), alpha = 0.35, label = "SPY Returns")
     end
     savefig(p6, joinpath(plot_dir, "return_distribution_$(YR).png"))
     display(p6)
 
-    # Chart 9: Rolling Sharpe Ratio (60-day)
     if nrow(daily_df) > 65
         window_sharpe = 60
         roll_sharpe = Float64[]
@@ -602,14 +610,13 @@ if nrow(daily_df) > 5
             s = std(w) > 0 ? (mean(w) * 252) / (std(w) * sqrt(252)) : 0.0
             push!(roll_sharpe, s)
         end
-        p7 = plot(dates_plot[(window_sharpe+1):end], roll_sharpe,
-            title = "Rolling 60-Day Sharpe Ratio ($(YR))",
+        p7 = plot(dates_plot[(window_sharpe+1):end], roll_sharpe;
+            _CHART_DEFAULTS..., size = (960, 300),
+            title = "Figure 7: Rolling 60-Day Sharpe Ratio ($(YR))",
             xlabel = "Date", ylabel = "Sharpe Ratio",
-            label = "Wheel Strategy", linewidth = 1.5, color = :steelblue,
-            size = (900, 300), dpi = 150,
-            left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
-        hline!([0.0], linestyle = :dash, color = :gray, label = nothing)
-        hline!([1.0], linestyle = :dot, color = :green, alpha = 0.5, label = "Sharpe=1.0")
+            label = "Wheel Strategy", linewidth = 1.5, color = RGB(0.2, 0.4, 0.7))
+        hline!([0.0], linestyle = :dash, color = :gray60, label = nothing, linewidth = 0.8)
+        hline!([1.0], linestyle = :dot, color = RGB(0.2, 0.6, 0.3), alpha = 0.6, label = "Sharpe = 1.0")
         if hasproperty(daily_df, :SPY_Return)
             spy_sharpe = Float64[]
             spy_dr_all = daily_df.SPY_Return
@@ -619,51 +626,47 @@ if nrow(daily_df) > 5
                 push!(spy_sharpe, s)
             end
             plot!(dates_plot[(window_sharpe+1):end], spy_sharpe,
-                  label = "SPY", linewidth = 1.0, color = :orange, linestyle = :dash)
+                  label = "SPY", linewidth = 1.0, color = RGB(0.85, 0.45, 0.15), linestyle = :dash)
         end
         savefig(p7, joinpath(plot_dir, "rolling_sharpe_$(YR).png"))
         display(p7)
     end
 
-    # Chart 10: Per-Ticker Premium Bar Chart
     top_n = min(15, nrow(ticker_perf_df))
     top_tickers = ticker_perf_df[1:top_n, :]
-    colors_bar = [s == "Safe" ? :steelblue : :orange for s in top_tickers.Sleeve]
-    p8 = bar(top_tickers.Ticker, top_tickers.Premium ./ 1e6,
-        title = "Top $(top_n) Tickers by Premium Income ($(YR))",
+    colors_bar = [s == "Safe" ? RGB(0.2, 0.4, 0.7) : RGB(0.85, 0.45, 0.15) for s in top_tickers.Sleeve]
+    p8 = bar(top_tickers.Ticker, top_tickers.Premium ./ 1e6;
+        _CHART_DEFAULTS...,
+        title = "Figure 8: Premium Income by Ticker ($(YR))",
         xlabel = "Ticker", ylabel = "Premium (\$ millions)",
-        label = nothing, color = colors_bar, alpha = 0.8,
-        size = (900, 400), dpi = 150, rotation = 45,
-        left_margin = 10Plots.mm, bottom_margin = 12Plots.mm)
+        label = nothing, color = colors_bar, alpha = 0.85, rotation = 45,
+        bottom_margin = 14Plots.mm)
     savefig(p8, joinpath(plot_dir, "premium_by_ticker_$(YR).png"))
     display(p8)
 
-    # Chart 11: Option MTM Over Time
-    p9 = plot(dates_plot, daily_df.OptionMTM ./ 1e6,
-        title = "Short Option Mark-to-Market Liability ($(YR))",
+    p9 = plot(dates_plot, daily_df.OptionMTM ./ 1e6;
+        _CHART_DEFAULTS..., size = (960, 300),
+        title = "Figure 9: Short Option Mark-to-Market ($(YR))",
         xlabel = "Date", ylabel = "\$ millions (negative = liability)",
-        label = "Option MTM", linewidth = 1.5, color = :red,
-        fill = (0, 0.15, :red),
-        size = (900, 300), dpi = 150,
-        left_margin = 10Plots.mm, bottom_margin = 8Plots.mm)
+        label = "Option MTM", linewidth = 1.5, color = RGB(0.8, 0.15, 0.15),
+        fill = (0, 0.12, RGB(0.8, 0.15, 0.15)))
     savefig(p9, joinpath(plot_dir, "option_mtm_$(YR).png"))
     display(p9)
 
-    # Chart 12: Monthly Returns Bar
     if @isdefined(monthly_df) && nrow(monthly_df) > 0
-        month_colors = [r >= 0 ? :green : :red for r in monthly_df.Return]
-        p10 = bar(monthly_df.Month, monthly_df.Return,
-            title = "Monthly Returns ($(YR)) (%)",
+        month_colors = [r >= 0 ? RGB(0.2, 0.6, 0.3) : RGB(0.8, 0.15, 0.15) for r in monthly_df.Return]
+        p10 = bar(monthly_df.Month, monthly_df.Return;
+            _CHART_DEFAULTS..., size = (960, 340),
+            title = "Figure 10: Monthly Returns ($(YR))",
             xlabel = "Month", ylabel = "Return (%)",
-            label = nothing, color = month_colors, alpha = 0.8,
-            size = (900, 350), dpi = 150, rotation = 45,
-            left_margin = 10Plots.mm, bottom_margin = 12Plots.mm)
-        hline!([0.0], linestyle = :dash, color = :black, label = nothing)
+            label = nothing, color = month_colors, alpha = 0.85, rotation = 45,
+            bottom_margin = 14Plots.mm)
+        hline!([0.0], linestyle = :dash, color = :black, label = nothing, linewidth = 0.8)
         savefig(p10, joinpath(plot_dir, "monthly_returns_$(YR).png"))
         display(p10)
     end
 
-    println("\n  -> All charts saved to data/ folder")
+    println("\n  -> All charts saved to data/ folder (academic style)")
 end
 
 # PART 5 (optional): PARAMETER SWEEP (Varner PDF §6)
@@ -743,8 +746,7 @@ if RUN_PARAMETER_SWEEP
               round(tp/1e6, digits=2), ta, tc2, tt))
     end
 
-    pretty_table(sweep_results,
-        column_labels=["Configuration", "Final NAV (M\$)", "Return %",
+    pretty_table(sweep_results,        column_labels=["Configuration", "Final NAV (M\$)", "Return %",
                         "Sharpe", "Sortino", "MaxDD %", "Premium (M\$)",
                         "Assigns", "CallAways", "Trades"])
 end
@@ -752,73 +754,43 @@ end
 # PART 6 (optional): PORTFOLIO-LEVEL STRESS TESTS (Varner PDF §7B)
 
 if RUN_STRESS_TEST
-    println("\n--- Part 6: Portfolio-Level Stress Tests (PDF §7B) ---\n")
+    run_portfolio_stress_tests(;
+        price_data, div_data, vol_map, vix_data,
+        all_tickers, sleeves, weights, sleeves_map,
+        initial_nav, prices_day1, config,
+        earnings_cal, sector_map, div_yields,
+        safe_tickers, aggressive_tickers,
+        chart_defaults=_CHART_DEFAULTS,
+        heston_ts=heston_ts)
+end
 
-    stress_results = DataFrame(
-        Scenario=String[], FinalNAV=Float64[], Return=Float64[],
-        Sharpe=Float64[], MaxDD=Float64[], Premium=Float64[]
-    )
+# PART 7 (optional): MONTE CARLO ROBUST SIMULATION (Varner PDF §7B)
 
-    for sc in EXTENDED_STRESS_SCENARIOS
-        stressed_prices = apply_stress_to_prices(price_data;
-            vol_mult=sc.vol_mult, drift_adj=sc.drift_adj,
-            gap_pct=sc.gap_pct, gap_day=sc.gap_day,
-            spread_widening=sc.spread_w,
-            liquidity_thin_pct=sc.liq_thin)
+if RUN_ROBUST_MC
+    run_robust_mc_simulation(;
+        price_data, div_data, vol_map, vix_data,
+        all_tickers, sleeves, weights, sleeves_map,
+        initial_nav, prices_day1, config,
+        earnings_cal, sector_map, div_yields,
+        trading_days, daily_df,
+        safe_tickers, aggressive_tickers,
+        chart_defaults=_CHART_DEFAULTS, yr=YR,
+        heston_ts=heston_ts,
+        n_mc_runs=20)
+end
 
-        stressed_rolling = compute_rolling_volatility(stressed_prices; window=30)
+# PART 8 (optional): PAPER/SHADOW PORTFOLIO VALIDATION (Varner PDF §7C)
 
-        pf = initialize_portfolio(all_tickers, sleeves, weights, initial_nav, prices_day1, config)
-        stressed_days = get_trading_days(stressed_prices)
-
-        stressed_iv = compute_rolling_iv(stressed_rolling, sleeves_map)
-        run_backtest!(pf, stressed_prices, div_data, vol_map, stressed_days;
-                      earnings_cal=earnings_cal, rolling_vol=stressed_rolling,
-                      sector_map=sector_map, div_yields=div_yields,
-                      rolling_iv=stressed_iv)
-
-        recs = pf.daily_records
-        isempty(recs) && continue
-        fin = recs[end].nav
-        ret = (fin - initial_nav) / initial_nav * 100.0
-        navs = [r.nav for r in recs]
-        local dr = diff(log.(navs))
-        sh = length(dr) > 0 && std(dr) > 0 ? (mean(dr)*252) / (std(dr)*sqrt(252)) : 0.0
-        pk, mdd = -Inf, 0.0
-        for v in navs; pk = max(pk, v); mdd = max(mdd, (pk-v)/pk); end
-        tp = recs[end].cumulative_premium
-
-        push!(stress_results, (sc.label, round(fin/1e6, digits=2), round(ret, digits=2),
-              round(sh, digits=3), round(mdd*100, digits=2), round(tp/1e6, digits=2)))
-    end
-
-    pretty_table(stress_results,
-        column_labels=["Scenario", "Final NAV (M\$)", "Return %",
-                        "Sharpe", "MaxDD %", "Premium (M\$)"])
-
-    println("\n-- Single-Ticker Stress (incl. Earnings Jump GBM) --")
-    for (label, ticker) in [("Safe", safe_tickers[1]), ("Aggressive", aggressive_tickers[1])]
-        haskey(prices_day1, ticker) || continue
-        S0 = prices_day1[ticker]
-        mu = get(vol_map, ticker, 0.08) * 0.5
-        sig = get(vol_map, ticker, 0.25)
-
-        println("\n  $label representative: $ticker (S0=\$$(round(S0, digits=2)), sig=$(round(sig, digits=2)))")
-
-        results = run_stress_scenarios(S0, mu, sig, 1.0; n_paths=5000)
-        pretty_table(results,
-            column_labels=["Scenario", "Mean Ret%", "Median Ret%",
-                            "VaR 95%", "Avg MaxDD%", "% Below -20%"])
-
-        earnings_steps = [63, 126, 189, 252]
-        ejump_paths = simulate_earnings_jump_gbm(S0, mu, sig, 1.0, earnings_steps;
-            jump_mean=0.0, jump_std=0.07, vol_crush=0.60, n_paths=5000)
-        ej_summary = mc_summary(ejump_paths)
-        println("  Earnings-Jump GBM (4 events, jump_std=7%, vol_crush=60%):")
-        println("    Mean return: $(round(ej_summary.mean_return*100, digits=2))%")
-        println("    VaR 95:      $(round(ej_summary.var_95*100, digits=2))%")
-        println("    Std return:  $(round(ej_summary.std_return*100, digits=2))%")
-    end
+if RUN_PAPER_PORTFOLIO
+    run_paper_portfolio_validation(;
+        price_data, div_data, vol_map,
+        all_tickers, sleeves, weights,
+        initial_nav, config,
+        earnings_cal, sector_map, div_yields,
+        rolling_vol, rolling_iv,
+        trading_days, daily_df,
+        portfolio,
+        chart_defaults=_CHART_DEFAULTS, yr=YR)
 end
 
 println("\n Done. $(YR) Backtest complete.")
