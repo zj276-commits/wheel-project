@@ -115,11 +115,12 @@ function display_chain(ticker::String, tenor_days::Int)
     q = get_dividend_yield(ticker)
     T = tenor_days / 365.0
 
-    params = lookup_heston_params(_VIEWER_HESTON_TS, ticker, Dates.today())
-    if params === nothing
+    raw_params = lookup_heston_params(_VIEWER_HESTON_TS, ticker, Dates.today())
+    if raw_params === nothing
         println("  No Heston calibration for $ticker — run `julia calibrate_heston.jl` first")
         return
     end
+    params = vix_adjusted_params(raw_params, vxx_regime)
 
     strikes = Float64[]
     for δ in DELTA_TARGETS
@@ -170,8 +171,8 @@ function display_chain(ticker::String, tenor_days::Int)
     println()
     println("="^130)
     println("  $ticker Option Chain | Spot: \$$(round(S, digits=2)) | Tenor: $(tenor_days)d | Sleeve: $sleeve")
-    println("  Heston: v0=$(round(params.v0, digits=4)) kappa=$(params.kappa) theta=$(round(params.theta, digits=4)) xi=$(params.xi) rho=$(params.rho)")
-    println("  RV: $(round(σ_rv*100, digits=1))% | VXX regime: $(round(vxx_regime, digits=2))x | Div Yield: $(round(q*100, digits=2))%")
+    println("  Heston: v0=$(round(raw_params.v0, digits=4))→$(round(params.v0, digits=4)) (×$(round(vxx_regime, digits=2))) κ=$(params.kappa) θ=$(round(params.theta, digits=4)) ξ=$(params.xi) ρ=$(params.rho)")
+    println("  RV: $(round(σ_rv*100, digits=1))% | VIX regime: $(round(vxx_regime, digits=2))x | Div Yield: $(round(q*100, digits=2))%")
     println("="^130)
 
     widths = [9, 7, 8, 8, 8, 7, 8, 8, 8, 8, 7, 8, 10, 8]
@@ -224,18 +225,19 @@ function main_loop()
                     println()
                     continue
                 end
-                println("    VXX regime: $(round(vxx_r, digits=2))x")
+                println("    VIX regime: $(round(vxx_r, digits=2))x")
                 for tk in TICKERS
                     S = load_latest_price(tk)
                     isnan(S) && continue
                     σ_rv = compute_rolling_vol_single(tk)
                     isnan(σ_rv) && continue
                     sl = get(SLEEVES, tk, "Safe")
-                    params = lookup_heston_params(_VIEWER_HESTON_TS, tk, Dates.today())
-                    if params === nothing
+                    raw_p = lookup_heston_params(_VIEWER_HESTON_TS, tk, Dates.today())
+                    if raw_p === nothing
                         println("    $tk: ⚠ no calibration"); continue
                     end
-                    atm_iv = heston_implied_vol(S, S, 30.0/365.0, R, params; option_type=:put)
+                    adj_p = vix_adjusted_params(raw_p, vxx_r)
+                    atm_iv = heston_implied_vol(S, S, 30.0/365.0, R, adj_p; option_type=:put)
                     println("    $tk: Spot=\$$(round(S, digits=2))  RV=$(round(σ_rv*100, digits=1))%  HestonIV=$(round(atm_iv*100, digits=1))%  [$sl]")
                 end
                 println()

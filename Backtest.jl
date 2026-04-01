@@ -218,7 +218,7 @@ end
 rolling_vol = compute_rolling_volatility(price_data; window=30);
 div_yields = compute_dividend_yields(div_data, price_data);
 
-# ── 2f: Load VXX (VIX proxy) for Heston calibration ───────────────────────
+# ── 2f: Load VXX (VIX proxy) for daily v₀ adjustment ─────────────────────
 
 vix_data = nothing
 try
@@ -250,9 +250,14 @@ end
 
 # ── 2g: Implied volatility — Heston stochastic volatility model ───────────
 
-println("  Building Heston IV map from calibrated params...")
+println("  Building Heston IV map (VIX-adjusted v₀)...")
+vix_regime_series = if vix_data !== nothing && nrow(vix_data) > 20
+    compute_vix_regime_series(vix_data)
+else
+    Dict{Date, Float64}()
+end
 rolling_iv = build_heston_iv_map(price_data, trading_days;
-                                   r=0.045, heston_ts=heston_ts)
+                                   r=0.045, heston_ts=heston_ts, vix_data=vix_data)
 println("  Heston IV map: $(length(rolling_iv)) tickers total")
 
 # ── 2h: Load earnings calendar ──────────────────────────────────────────────
@@ -354,7 +359,8 @@ println("  Running $(length(trading_days)) trading days...\n")
 run_backtest!(portfolio, price_data, div_data, vol_map, trading_days;
               earnings_cal=earnings_cal, rolling_vol=rolling_vol,
               sector_map=sector_map, div_yields=div_yields,
-              rolling_iv=rolling_iv);
+              rolling_iv=rolling_iv,
+              heston_ts=heston_ts, vix_regime=vix_regime_series);
 
 # PART 4: RESULTS & REPORTING
 
@@ -722,7 +728,8 @@ if RUN_PARAMETER_SWEEP
         run_backtest!(pf, price_data, div_data, vol_map, trading_days;
                       earnings_cal=earnings_cal, rolling_vol=rolling_vol,
                       sector_map=sector_map, div_yields=div_yields,
-                      rolling_iv=rolling_iv)
+                      rolling_iv=rolling_iv,
+                      heston_ts=heston_ts, vix_regime=vix_regime_series)
 
         recs = pf.daily_records
         isempty(recs) && continue
@@ -790,7 +797,8 @@ if RUN_PAPER_PORTFOLIO
         rolling_vol, rolling_iv,
         trading_days, daily_df,
         portfolio,
-        chart_defaults=_CHART_DEFAULTS, yr=YR)
+        chart_defaults=_CHART_DEFAULTS, yr=YR,
+        heston_ts=heston_ts, vix_regime=vix_regime_series)
 end
 
 println("\n Done. $(YR) Backtest complete.")

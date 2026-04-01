@@ -476,7 +476,8 @@ end
 function fit_all_hmm(price_data::Dict{String, DataFrame},
                       tickers::Vector{String};
                       min_obs::Int=60, N::Int=100,
-                      nu::Float64=5.0)::Dict{String, JumpHMM}
+                      nu::Float64=5.0,
+                      tune_jumps::Bool=true)::Dict{String, JumpHMM}
     results = Dict{String, JumpHMM}()
     for tk in tickers
         !haskey(price_data, tk) && continue
@@ -485,9 +486,13 @@ function fit_all_hmm(price_data::Dict{String, DataFrame},
         try
             prices = Float64.(df.adj_close)
             model = fit_jumphmm(prices; N=N, nu=nu)
+            if tune_jumps
+                model = tune_jumphmm(model, prices)
+            end
             results[tk] = model
             ll = hmm_log_likelihood(model, excess_growth_rates(prices))
-            println("    $tk: N=$(model.partition.N), nu=$(model.nu), LL=$(round(ll, digits=1))")
+            jp = model.jump
+            println("    $tk: N=$(model.partition.N), ε=$(round(jp.epsilon, digits=4)), λ=$(round(jp.lambda, digits=1)), LL=$(round(ll, digits=1))")
         catch e
             @warn "JumpHMM fit failed for $tk: $e"
         end
@@ -812,6 +817,12 @@ function apply_stress_to_prices(price_data::Dict{String, DataFrame};
             factor = 1.0 + gap_pct
             for i in gap_day:length(prices)
                 prices[i] *= factor
+            end
+        end
+        if spread_widening > 1.0
+            for i in 1:length(prices)
+                noise = (rand() - 0.5) * 2.0 * (spread_widening - 1.0) * 0.001
+                prices[i] *= (1.0 + noise)
             end
         end
         sdf.adj_close = prices
