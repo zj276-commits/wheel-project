@@ -253,6 +253,11 @@ function calibrate_iv(σ_rv::Float64, T::Float64, moneyness::Float64,
 end
 
 """
+This calculates the realized volatility from historical price data from Yahoo Finance. 
+
+This then converts the realized volatility to implied volatility using the VRP model, if implied volatility data is not available from WRDS/csv. 
+
+
     compute_rolling_iv(rolling_vol, sleeves_map; iv_cals=nothing) -> Dict{String, Dict{Date, Float64}}
 
 Convert rolling realized vol to rolling implied vol for all tickers.
