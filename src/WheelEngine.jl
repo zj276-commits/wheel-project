@@ -313,7 +313,7 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
     for (tk, state) in portfolio.states
         p = get(prices, tk, NaN)
         isnan(p) && continue
-        σ = _resolve_vol(rolling_vol, vol_map, tk, date)
+        σ_rv = _resolve_vol(rolling_vol, vol_map, tk, date)
         q = if div_data !== nothing && haskey(div_data, tk)
             trailing_dividend_yield(div_data[tk], p, date)
         elseif div_yields !== nothing
@@ -322,9 +322,9 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
             0.0
         end
         pricing_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
-            get(rolling_iv[tk], date, σ)
+            get(rolling_iv[tk], date, σ_rv)
         else
-            σ
+            σ_rv
         end
 
         bav += state.block_a_shares * p
@@ -374,7 +374,8 @@ function _resolve_vol(rolling_vol, vol_map::Dict{String, Float64},
         rv = rolling_vol[ticker]
         haskey(rv, date) && return rv[date]
     end
-    return get(vol_map, ticker, 0.25)
+    haskey(vol_map, ticker) || error("No volatility data for $ticker on $date — check vol_map population")
+    return vol_map[ticker]
 end
 
 # ── Main Simulation Loop ─────────────────────────────────────────────────────
@@ -425,7 +426,7 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
 
         for (tk, state) in portfolio.states
             p = get(cp, tk, NaN); isnan(p) && continue
-            σ = _resolve_vol(rolling_vol, vol_map, tk, date)
+            σ_rv = _resolve_vol(rolling_vol, vol_map, tk, date)
             ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
             q = trailing_dividend_yield(ddf, p, date)
 
@@ -434,6 +435,10 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             else
                 NaN
             end
+
+            # Heston IV drives all option decisions (delta, strike, tenor, roll);
+            # RV is only a fallback when IV is unavailable.
+            σ = isnan(σ_iv_val) ? σ_rv : σ_iv_val
 
             pdf_tk = get(price_data, tk, nothing)
             adv_val = 0.0

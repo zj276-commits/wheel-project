@@ -1,0 +1,10 @@
+Scenario,FinalNAV_M,Return_pct,Sharpe,MaxDD_pct,Premium_M
+Normal (baseline),650.03,8.34,0.877,11.0,4.43
+Vol Spike (2x vol),-4454.91,-842.49,-1.189,848.86,-4847.08
+Bear Market (-20% drift),597.39,-0.44,0.084,12.67,-24.49
+Flash Crash (-10% gap d30),-4021.18,-770.2,-1.257,775.95,-4369.14
+Name Blowup (-30% gap d60),434.74,-27.54,-0.84,36.26,-76.84
+Bull Squeeze (+15% gap d45),647.47,7.91,0.454,11.2,-23.47
+Vol Crush (post-earnings),657.6,9.6,1.723,8.05,20.99
+Liquidity Thinning (70% vol),631.63,5.27,0.508,11.44,-0.53
+Spread Widening (close micro.),647.41,7.9,0.842,11.0,4.43

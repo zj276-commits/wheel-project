@@ -1,9 +1,9 @@
 """
 Heston Stochastic Volatility Model — IV Surface Generation
 
-Replaces the previous WRDS lookup approach. All IV is now model-derived
-via the Heston (1993) framework, making the system forward-looking and
-applicable to any tenor without historical option data dependency.
+All IV is model-derived via the Heston (1993) framework, calibrated from
+VIX + realized vol. No external IV data sources (WRDS, OptionMetrics, etc.)
+are used. The system is forward-looking and applicable to any tenor.
 
 Model:
   dS = μ S dt + √v S dW₁
@@ -144,50 +144,56 @@ end
 # ── Calibration ──────────────────────────────────────────────────────────────
 
 """
-    calibrate_heston_from_vix(vix_level, realized_vol; sleeve) -> HestonParams
+    HestonCalibration
 
-Quick calibration using VIX as v₀ proxy and realized vol as θ proxy.
-VIX = 100 × √(annualized 30-day expected variance), so v₀ ≈ (VIX/100)².
-
-Sleeve-dependent defaults for κ, ξ, ρ based on empirical equity option surfaces.
+Per-ticker, per-date Heston parameters calibrated from real market option data.
+All five parameters (v₀, κ, θ, ξ, ρ) come directly from fitting to option prices.
+No hardcoded defaults, no VRP.
 """
-function calibrate_heston_from_vix(vix_level::Float64, realized_vol::Float64;
-                                    sleeve::String="Safe")::HestonParams
-    v0 = (vix_level / 100.0)^2
-    θ = max(realized_vol^2, 0.01^2)
-
-    if sleeve == "Aggressive"
-        return HestonParams(v0, 2.0, θ, 0.6, -0.70)
-    else
-        return HestonParams(v0, 3.0, θ, 0.4, -0.65)
-    end
+struct HestonCalibration
+    v0::Float64
+    kappa::Float64
+    theta::Float64
+    xi::Float64
+    rho::Float64
 end
 
+const HESTON_CAL_PATH = joinpath(_PATH_TO_DATA, "heston_params.csv")
+
 """
-    calibrate_heston_from_options(S, r, option_data; q, initial_params) -> HestonParams
+    calibrate_heston_from_options(S, r, option_data; q) -> HestonParams
 
-Full calibration by minimizing sum of squared errors between Heston model
-prices and observed market prices across multiple (K, T) pairs.
+Calibrate all 5 Heston parameters by minimizing SSE between Heston model
+prices and real market mid-prices via grid search.
 
-option_data: Vector of NamedTuples with fields: K, T, market_price, option_type
+Input: a set of (K, T, market_price, option_type) observations from a single day.
 """
 function calibrate_heston_from_options(S::Float64, r::Float64,
                                         option_data::Vector;
-                                        q::Float64=0.0,
-                                        initial_params::HestonParams=HestonParams(0.04, 2.0, 0.04, 0.5, -0.7))::HestonParams
-    length(option_data) < 3 && return initial_params
+                                        q::Float64=0.0)::HestonParams
+    length(option_data) < 3 && error("Need ≥3 option observations, got $(length(option_data))")
 
-    best_params = initial_params
+    atm_opts = filter(o -> abs(o.K - S) / S < 0.05, option_data)
+    v0_est = if !isempty(atm_opts)
+        avg_mid = mean(o.market_price for o in atm_opts)
+        avg_T = mean(o.T for o in atm_opts)
+        max((avg_mid / S / 0.4)^2 / max(avg_T, 0.01), 0.005^2)
+    else
+        (0.25)^2
+    end
+    v0_est = clamp(v0_est, 0.005^2, 2.0^2)
+
+    best_params = HestonParams(v0_est, 2.0, v0_est, 0.5, -0.7)
     best_error = Inf
 
-    v0_grid = [initial_params.v0]
-    κ_grid  = [1.0, 2.0, 3.0, 5.0, 8.0]
-    θ_grid  = [initial_params.theta * f for f in [0.5, 0.75, 1.0, 1.25, 1.5]]
-    ξ_grid  = [0.2, 0.4, 0.6, 0.8, 1.0]
-    ρ_grid  = [-0.9, -0.8, -0.7, -0.6, -0.5, -0.4]
+    v0_grid  = [v0_est * f for f in [0.5, 0.75, 1.0, 1.5, 2.0]]
+    kap_grid = [0.5, 1.0, 2.0, 4.0, 8.0]
+    tht_grid = [v0_est * f for f in [0.5, 1.0, 1.5]]
+    xi_grid  = [0.2, 0.5, 0.8]
+    rho_grid = [-0.9, -0.7, -0.5, -0.3]
 
-    for κ in κ_grid, θ in θ_grid, ξ in ξ_grid, ρ in ρ_grid
-        params = HestonParams(initial_params.v0, κ, θ, ξ, ρ)
+    for v0 in v0_grid, kap in kap_grid, tht in tht_grid, xi in xi_grid, rho in rho_grid
+        params = HestonParams(v0, kap, tht, xi, rho)
         total_err = 0.0
         valid = true
         for opt in option_data
@@ -197,8 +203,7 @@ function calibrate_heston_from_options(S::Float64, r::Float64,
                     heston_put_price(S, opt.K, opt.T, r, params; q=q)
                 total_err += (model_price - opt.market_price)^2
             catch
-                valid = false
-                break
+                valid = false; break
             end
         end
         if valid && total_err < best_error
@@ -211,19 +216,43 @@ function calibrate_heston_from_options(S::Float64, r::Float64,
 end
 
 """
-    calibrate_heston_rv_only(realized_vol; sleeve) -> HestonParams
+    load_heston_params(path) -> Dict{String, Dict{Date, HestonCalibration}}
 
-Fallback calibration using only realized volatility (no VIX, no option data).
+Load rolling Heston calibration time-series produced by `calibrate_heston.jl`.
+Returns: ticker → (date → HestonCalibration)
 """
-function calibrate_heston_rv_only(realized_vol::Float64;
-                                   sleeve::String="Safe")::HestonParams
-    v0 = realized_vol^2
-    θ = v0
-    if sleeve == "Aggressive"
-        return HestonParams(v0, 2.0, θ, 0.6, -0.70)
-    else
-        return HestonParams(v0, 3.0, θ, 0.4, -0.65)
+function load_heston_params(path::String)::Dict{String, Dict{Date, HestonCalibration}}
+    df = CSV.read(path, DataFrame)
+    result = Dict{String, Dict{Date, HestonCalibration}}()
+    for row in eachrow(df)
+        tk = row.ticker
+        d = Date(row.date)
+        cal = HestonCalibration(row.v0, row.kappa, row.theta, row.xi, row.rho)
+        if !haskey(result, tk)
+            result[tk] = Dict{Date, HestonCalibration}()
+        end
+        result[tk][d] = cal
     end
+    n_tickers = length(result)
+    n_dates = isempty(result) ? 0 : maximum(length(v) for v in values(result))
+    println("  -> Loaded Heston params: $(n_tickers) tickers × up to $(n_dates) calibration dates")
+    return result
+end
+
+"""
+    lookup_heston_params(heston_ts, ticker, date) -> HestonParams
+
+Find the most recent calibration on or before `date` for `ticker`.
+"""
+function lookup_heston_params(heston_ts::Dict{String, Dict{Date, HestonCalibration}},
+                                ticker::String, date::Date)::Union{HestonParams, Nothing}
+    !haskey(heston_ts, ticker) && return nothing
+    cal_dates = sort(collect(keys(heston_ts[ticker])))
+    isempty(cal_dates) && return nothing
+    idx = searchsortedlast(cal_dates, date)
+    idx == 0 && return nothing
+    cal = heston_ts[ticker][cal_dates[idx]]
+    return HestonParams(cal.v0, cal.kappa, cal.theta, cal.xi, cal.rho)
 end
 
 # ── IV Surface Generation ────────────────────────────────────────────────────
@@ -259,46 +288,36 @@ function generate_iv_surface(S::Float64, r::Float64, params::HestonParams;
 end
 
 """
-    build_heston_iv_map(price_data, rolling_vol, sleeves_map, trading_days;
-                         vix_data, r) -> Dict{String, Dict{Date, Float64}}
+    build_heston_iv_map(price_data, trading_days;
+                         r, heston_ts) -> Dict{String, Dict{Date, Float64}}
 
-Build rolling IV map using Heston model, compatible with WheelEngine.
-For each ticker on each trading day, calibrate Heston and extract ATM IV.
+Build rolling IV map using pre-calibrated Heston parameters from
+`calibrate_heston.jl`. For each (ticker, date), look up the most recent
+calibration and extract ATM 30-day put IV.
 
-Output format matches the old rolling_iv: Dict{ticker => Dict{date => iv}}
+All parameters (v₀, κ, θ, ξ, ρ) come from the calibration — no defaults.
 """
 function build_heston_iv_map(price_data::Dict{String, DataFrame},
-                               rolling_vol::Dict{String, Dict{Date, Float64}},
-                               sleeves_map::Dict{String, String},
                                trading_days::Vector{Date};
-                               vix_data=nothing,
-                               r::Float64=0.045)::Dict{String, Dict{Date, Float64}}
+                               r::Float64=0.045,
+                               heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}()
+                               )::Dict{String, Dict{Date, Float64}}
     result = Dict{String, Dict{Date, Float64}}()
 
-    vix_lookup = Dict{Date, Float64}()
-    if vix_data !== nothing && hasproperty(vix_data, :date) && hasproperty(vix_data, :close)
-        for row in eachrow(vix_data)
-            vix_lookup[row.date] = row.close
-        end
-    end
-
-    for (tk, vol_dict) in rolling_vol
-        sleeve = get(sleeves_map, tk, "Safe")
+    for (tk, tk_df) in price_data
+        !haskey(heston_ts, tk) && continue
         iv_dict = Dict{Date, Float64}()
 
         for d in trading_days
-            σ_rv = get(vol_dict, d, NaN)
-            isnan(σ_rv) && continue
+            params = lookup_heston_params(heston_ts, tk, d)
+            params === nothing && continue
 
-            vix_val = get(vix_lookup, d, NaN)
-
-            params = if !isnan(vix_val)
-                calibrate_heston_from_vix(vix_val, σ_rv; sleeve=sleeve)
+            S = get_price_on_date(tk_df, d)
+            if S !== nothing && S > 0.0
+                iv_dict[d] = heston_implied_vol(Float64(S), Float64(S), 30.0/365.0, r, params; option_type=:put)
             else
-                calibrate_heston_rv_only(σ_rv; sleeve=sleeve)
+                iv_dict[d] = sqrt(params.v0)
             end
-
-            iv_dict[d] = sqrt(params.v0)
         end
 
         if !isempty(iv_dict)
@@ -306,7 +325,13 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
         end
     end
 
-    println("  Heston IV map: $(length(result)) tickers")
+    n_total = length(price_data)
+    n_done = length(result)
+    if n_done < n_total
+        missing_tks = [tk for tk in keys(price_data) if !haskey(result, tk)]
+        @warn "Tickers without Heston calibration (no IV generated): $missing_tks"
+    end
+    println("  Heston IV map: $(n_done)/$(n_total) tickers")
     return result
 end
 

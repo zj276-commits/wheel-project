@@ -1,68 +1,132 @@
-"""Convert YFinance timestamps to Date vector, handling DateTime or numeric types."""
-function _to_dates(timestamps)::Vector{Date}
-    return [t isa DateTime ? Date(t) : Date(unix2datetime(Float64(t))) for t in timestamps]
+"""
+Data loading from VLQuantitativeFinancePackage (Polygon.io).
+
+Training set: MyTrainingMarketDataSet()  → SP500 OHLC, 2014-01-03 to 2024-12-31
+Testing set:  MyTestingMarketDataSet()   → SP500 OHLC, 2025-01-02 to present
+
+Polygon columns → our columns:
+  timestamp → date (Date)
+  open, high, low, close, volume → same names
+  close → adj_close (Polygon prices are already split-adjusted)
+  volume_weighted_average_price, number_of_transactions → dropped
+
+VXX (iPath VIX ETN) is used as the VIX proxy.
+Dividend data still uses cached CSVs from prior YFinance downloads.
+"""
+
+const TICKER_ALIASES = Dict{String,String}(
+    "META" => "FB",
+)
+
+# Lazy-loaded global caches — loaded once on first access
+const _VLQF_TRAINING = Ref{Union{Nothing, Dict{String, DataFrame}}}(nothing)
+const _VLQF_TESTING  = Ref{Union{Nothing, Dict{String, DataFrame}}}(nothing)
+
+function _ensure_training_loaded()
+    if _VLQF_TRAINING[] === nothing
+        println("  Loading VLQuantitativeFinancePackage training data (2014-2024)...")
+        _VLQF_TRAINING[] = MyTrainingMarketDataSet()["dataset"]
+        println("  Training data: $(length(_VLQF_TRAINING[])) tickers")
+    end
+    return _VLQF_TRAINING[]
 end
 
-"""Convert YFinance numeric vectors to Float64, replacing nothing/missing with NaN."""
-function _to_float_vec(v)::Vector{Float64}
-    return [x === nothing || ismissing(x) ? NaN : Float64(x) for x in v]
+function _ensure_testing_loaded()
+    if _VLQF_TESTING[] === nothing
+        println("  Loading VLQuantitativeFinancePackage testing data (2025)...")
+        _VLQF_TESTING[] = MyTestingMarketDataSet()["dataset"]
+        println("  Testing data: $(length(_VLQF_TESTING[])) tickers")
+    end
+    return _VLQF_TESTING[]
+end
+
+"""
+Convert a Polygon DataFrame to our standard format.
+Polygon columns: volume, volume_weighted_average_price, open, close, high, low, timestamp, number_of_transactions
+Our columns: date, open, high, low, close, adj_close, volume
+"""
+function _polygon_to_standard(df::DataFrame)::DataFrame
+    result = DataFrame(
+        date      = Date.(df.timestamp),
+        open      = Float64.(df.open),
+        high      = Float64.(df.high),
+        low       = Float64.(df.low),
+        close     = Float64.(df.close),
+        adj_close = Float64.(df.close),
+        volume    = Float64.(df.volume),
+    )
+    filter!(row -> !isnan(row.close) && row.close > 0.0, result)
+    sort!(result, :date)
+    return result
 end
 
 """
     download_price_data(ticker, start_date, end_date; cache_year=2025) -> DataFrame
 
-Download daily OHLC price data from Yahoo Finance via YFinance.jl.
-Caches results to data/prices_<year>/<TICKER>.csv to avoid repeated API calls.
+Load daily OHLC price data from VLQuantitativeFinancePackage.
+Falls back to cached CSV if ticker not found in package data.
 Returns a DataFrame with columns: date, open, high, low, close, adj_close, volume.
 """
 function download_price_data(ticker::String, start_date::Date, end_date::Date;
                               cache_year::Int=2025)::DataFrame
-    cache_dir = joinpath(_PATH_TO_DATA, "prices_$(cache_year)")
-    mkpath(cache_dir)
-    cache_file = joinpath(cache_dir, "$(ticker).csv")
+    vlqf_data = cache_year >= 2025 ? _ensure_testing_loaded() : _ensure_training_loaded()
 
+    actual_ticker = ticker == "^VIX" ? "VXX" : ticker
+
+    if haskey(vlqf_data, actual_ticker)
+        raw_df = vlqf_data[actual_ticker]
+        std_df = _polygon_to_standard(raw_df)
+        return filter(row -> start_date <= row.date <= end_date, std_df)
+    end
+
+    if haskey(TICKER_ALIASES, actual_ticker)
+        alias = TICKER_ALIASES[actual_ticker]
+        if haskey(vlqf_data, alias)
+            println("    $actual_ticker not found → using alias $alias")
+            raw_df = vlqf_data[alias]
+            std_df = _polygon_to_standard(raw_df)
+            return filter(row -> start_date <= row.date <= end_date, std_df)
+        end
+    end
+
+    if cache_year < 2025
+        training = _ensure_training_loaded()
+        if haskey(training, actual_ticker)
+            raw_df = training[actual_ticker]
+            std_df = _polygon_to_standard(raw_df)
+            return filter(row -> start_date <= row.date <= end_date, std_df)
+        end
+        if haskey(TICKER_ALIASES, actual_ticker)
+            alias = TICKER_ALIASES[actual_ticker]
+            if haskey(training, alias)
+                println("    $actual_ticker not found → using alias $alias (training)")
+                raw_df = training[alias]
+                std_df = _polygon_to_standard(raw_df)
+                return filter(row -> start_date <= row.date <= end_date, std_df)
+            end
+        end
+    end
+
+    cache_dir = joinpath(_PATH_TO_DATA, "prices_$(cache_year)")
+    cache_file = joinpath(cache_dir, "$(ticker).csv")
     if isfile(cache_file)
         return CSV.read(cache_file, DataFrame)
     end
 
-    sd = Dates.format(start_date, "yyyy-mm-dd")
-    ed = Dates.format(end_date, "yyyy-mm-dd")
-
-    raw = get_prices(ticker, startdt=sd, enddt=ed, interval="1d")
-
-    if !haskey(raw, "timestamp") || isempty(raw["timestamp"])
-        @warn "No price data returned for $ticker"
-        return DataFrame(date=Date[], open=Float64[], high=Float64[], low=Float64[],
-                         close=Float64[], adj_close=Float64[], volume=Float64[])
-    end
-
-    timestamps = raw["timestamp"]
-    dates = _to_dates(timestamps)
-
-    df = DataFrame(
-        date      = dates,
-        open      = _to_float_vec(get(raw, "open", fill(NaN, length(dates)))),
-        high      = _to_float_vec(get(raw, "high", fill(NaN, length(dates)))),
-        low       = _to_float_vec(get(raw, "low", fill(NaN, length(dates)))),
-        close     = _to_float_vec(get(raw, "close", fill(NaN, length(dates)))),
-        adj_close = _to_float_vec(get(raw, "adjclose", get(raw, "close", fill(NaN, length(dates))))),
-        volume    = _to_float_vec(get(raw, "vol", fill(0.0, length(dates)))),
-    )
-
-    filter!(row -> !isnan(row.close), df)
-    sort!(df, :date)
-
-    CSV.write(cache_file, df)
-    return df
+    @warn "Ticker $ticker not found in VLQuantitativeFinancePackage or cache"
+    return DataFrame(date=Date[], open=Float64[], high=Float64[], low=Float64[],
+                     close=Float64[], adj_close=Float64[], volume=Float64[])
 end
 
 """
     download_all_prices(tickers, start_date, end_date; cache_year=2025) -> Dict{String, DataFrame}
 
-Download daily prices for all tickers. Shows progress and handles errors gracefully.
+Load daily prices for all tickers from VLQuantitativeFinancePackage.
 """
 function download_all_prices(tickers::Vector{String}, start_date::Date, end_date::Date;
                               cache_year::Int=2025)::Dict{String, DataFrame}
+    cache_year >= 2025 ? _ensure_testing_loaded() : _ensure_training_loaded()
+
     result = Dict{String, DataFrame}()
     for (i, ticker) in enumerate(tickers)
         print("  [$i/$(length(tickers))] $ticker ... ")
@@ -70,7 +134,7 @@ function download_all_prices(tickers::Vector{String}, start_date::Date, end_date
             result[ticker] = download_price_data(ticker, start_date, end_date; cache_year=cache_year)
             println("$(nrow(result[ticker])) days")
         catch e
-            @warn "Failed to download $ticker: $e"
+            @warn "Failed to load $ticker: $e"
         end
     end
     return result
@@ -79,44 +143,25 @@ end
 """
     download_dividends(ticker, start_date, end_date; cache_year=2025) -> DataFrame
 
-Download dividend payment data from Yahoo Finance.
+Load dividend data from cached CSVs (dividend data not available in VLQuantitativeFinancePackage).
 Returns DataFrame with columns: ex_date, amount.
 """
 function download_dividends(ticker::String, start_date::Date, end_date::Date;
                              cache_year::Int=2025)::DataFrame
     cache_dir = joinpath(_PATH_TO_DATA, "dividends_$(cache_year)")
-    mkpath(cache_dir)
     cache_file = joinpath(cache_dir, "$(ticker).csv")
 
     if isfile(cache_file)
         return CSV.read(cache_file, DataFrame)
     end
 
-    sd = Dates.format(start_date, "yyyy-mm-dd")
-    ed = Dates.format(end_date, "yyyy-mm-dd")
-
-    raw = get_prices(ticker, startdt=sd, enddt=ed, interval="1d", divsplits=true)
-
-    if !haskey(raw, "timestamp") || isempty(raw["timestamp"]) || !haskey(raw, "div")
-        CSV.write(cache_file, DataFrame(ex_date=Date[], amount=Float64[]))
-        return DataFrame(ex_date=Date[], amount=Float64[])
-    end
-
-    timestamps = raw["timestamp"]
-    dates = _to_dates(timestamps)
-    divs = _to_float_vec(raw["div"])
-
-    div_df = DataFrame(ex_date = dates, amount = divs)
-    filter!(row -> row.amount > 0.0, div_df)
-
-    CSV.write(cache_file, div_df)
-    return div_df
+    return DataFrame(ex_date=Date[], amount=Float64[])
 end
 
 """
     download_all_dividends(tickers, start_date, end_date; cache_year=2025) -> Dict{String, DataFrame}
 
-Download dividend data for all tickers.
+Load dividend data for all tickers from cached CSVs.
 """
 function download_all_dividends(tickers::Vector{String}, start_date::Date, end_date::Date;
                                  cache_year::Int=2025)::Dict{String, DataFrame}

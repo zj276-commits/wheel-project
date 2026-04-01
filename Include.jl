@@ -30,7 +30,6 @@ using PrettyTables
 using StatsBase
 using HTTP
 using JSON3
-using YFinance
 
 # ── Source modules (dependency order) ─────────────────────────────────────────
 
@@ -56,3 +55,7 @@ include(joinpath(_PATH_TO_SRC, "Simulation.jl"));
 
 # 6. PDF Section 7A — Backtest Engine (state machine + loop)
 include(joinpath(_PATH_TO_SRC, "WheelEngine.jl"));
+
+# 7. PDF Section 7B/7C — MC Orchestration + Paper Portfolio Validation
+include(joinpath(_PATH_TO_SRC, "MonteCarloBacktest.jl"));
+include(joinpath(_PATH_TO_SRC, "PaperPortfolio.jl"));

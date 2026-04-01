@@ -36,5 +36,10 @@ generate_report_pdf.py
 data/wrds_iv_surface.csv
 data/option_prices.csv
 
-# Temporary precompile script
+# Price caches (data now from VLQuantitativeFinancePackage)
+data/prices_*/
+
+# Temporary scripts
 _precompile.jl
+_explore_*.jl
+_find_*.jl
