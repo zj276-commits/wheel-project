@@ -83,15 +83,14 @@ end
 
 # ── Option Operations ────────────────────────────────────────────────────────
 
-"""Open a new option. Uses σ for delta targeting and σ_iv for pricing."""
+"""Open a new option. Uses σ for delta targeting; Heston per-option IV for pricing when available."""
 function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
                       date::Date, σ::Float64, config::WheelConfig,
                       portfolio::Portfolio;
                       earnings_cal=nothing, q::Float64=0.0,
                       near_earn::Bool=false, drawdown_pct::Float64=0.0,
-                      σ_iv::Float64=NaN, adv::Float64=0.0)::Float64
-    pricing_vol = isnan(σ_iv) ? σ : σ_iv
-
+                      σ_iv::Float64=NaN, adv::Float64=0.0,
+                      heston_params::Union{Nothing, HestonParams}=nothing)::Float64
     otype = slot.phase == SELLING_PUT ? :put : :call
     delta = get_target_delta(state, config, otype; σ=σ, near_earn=near_earn,
                               drawdown_pct=drawdown_pct)
@@ -105,6 +104,15 @@ function open_option!(state::TickerState, slot::LadderSlot, price::Float64,
     T = max(Dates.value(expiry - date) / 365.0, 1.0/365.0)
 
     K = strike_from_delta(price, T, config.risk_free_rate, σ, delta, otype; q=q)
+
+    pricing_vol = if heston_params !== nothing
+        heston_iv_for_option(price, K, T, config.risk_free_rate, heston_params;
+                              q=q, option_type=otype)
+    elseif !isnan(σ_iv)
+        σ_iv
+    else
+        σ
+    end
     prem = max(option_price(price, K, T, config.risk_free_rate, pricing_vol, otype;
                             steps=config.crr_steps, q=q), 0.01)
 
@@ -132,11 +140,19 @@ end
 """Mark-to-market value of slot's open option using CRR American pricing."""
 function close_option_mtm(slot::LadderSlot, price::Float64, date::Date,
                           σ::Float64, config::WheelConfig;
-                          q::Float64=0.0, σ_iv::Float64=NaN)::Float64
+                          q::Float64=0.0, σ_iv::Float64=NaN,
+                          heston_params::Union{Nothing, HestonParams}=nothing)::Float64
     opt = slot.option
     opt === nothing && return 0.0
     T = max(Dates.value(opt.expiry - date) / 365.0, 0.0)
-    pricing_vol = isnan(σ_iv) ? σ : σ_iv
+    pricing_vol = if heston_params !== nothing && T > 0.0
+        heston_iv_for_option(price, opt.strike, T, config.risk_free_rate, heston_params;
+                              q=q, option_type=opt.type)
+    elseif !isnan(σ_iv)
+        σ_iv
+    else
+        σ
+    end
     return option_price(price, opt.strike, T, config.risk_free_rate, pricing_vol, opt.type;
                         steps=config.crr_steps, q=q) * 100.0 * slot.num_contracts
 end
@@ -169,7 +185,9 @@ end
 
 """Four roll triggers per Varner PDF Section 3."""
 function should_roll(slot::LadderSlot, date::Date, price::Float64,
-                     σ::Float64, config::WheelConfig)::Bool
+                     σ::Float64, config::WheelConfig;
+                     heston_params::Union{Nothing, HestonParams}=nothing,
+                     q::Float64=0.0)::Bool
     opt = slot.option
     opt === nothing && return false
     dte = Dates.value(opt.expiry - date)
@@ -183,7 +201,13 @@ function should_roll(slot::LadderSlot, date::Date, price::Float64,
 
     if dte > 0
         T_remain = max(dte / 365.0, 1.0/365.0)
-        current_val = option_price(price, opt.strike, T_remain, config.risk_free_rate, σ,
+        roll_vol = if heston_params !== nothing
+            heston_iv_for_option(price, opt.strike, T_remain, config.risk_free_rate,
+                                  heston_params; q=q, option_type=opt.type)
+        else
+            σ
+        end
+        current_val = option_price(price, opt.strike, T_remain, config.risk_free_rate, roll_vol,
                                    opt.type; steps=config.crr_steps)
         if opt.premium > 0.0 && current_val / opt.premium < (1.0 - config.premium_decay_threshold)
             return true
@@ -213,15 +237,18 @@ function roll_option!(state::TickerState, slot::LadderSlot, price::Float64,
                       date::Date, σ::Float64, config::WheelConfig,
                       portfolio::Portfolio; earnings_cal=nothing, q::Float64=0.0,
                       near_earn::Bool=false, drawdown_pct::Float64=0.0,
-                      σ_iv::Float64=NaN, adv::Float64=0.0)::Float64
-    cc = close_option_mtm(slot, price, date, σ, config; q=q, σ_iv=σ_iv)
+                      σ_iv::Float64=NaN, adv::Float64=0.0,
+                      heston_params::Union{Nothing, HestonParams}=nothing)::Float64
+    cc = close_option_mtm(slot, price, date, σ, config; q=q, σ_iv=σ_iv,
+                          heston_params=heston_params)
     portfolio.cash -= cc
     slot.total_premium -= cc
     apply_trade_costs!(state, slot, cc, σ, config, portfolio; adv=adv)
     slot.option = nothing
     np = open_option!(state, slot, price, date, σ, config, portfolio;
                       earnings_cal=earnings_cal, q=q, near_earn=near_earn,
-                      drawdown_pct=drawdown_pct, σ_iv=σ_iv, adv=adv)
+                      drawdown_pct=drawdown_pct, σ_iv=σ_iv, adv=adv,
+                      heston_params=heston_params)
     portfolio.cash += np
     return np - cc
 end
@@ -306,7 +333,8 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                      date::Date, vol_map::Dict{String, Float64},
                      config::WheelConfig;
                      rolling_vol=nothing, div_yields=nothing,
-                     div_data=nothing, rolling_iv=nothing)::DailyRecord
+                     div_data=nothing, rolling_iv=nothing,
+                     heston_ts=nothing)::DailyRecord
     sv, omtm, bav, tp, td, tc = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     p_delta, p_gamma, p_vega = 0.0, 0.0, 0.0
 
@@ -321,7 +349,14 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         else
             0.0
         end
-        pricing_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
+
+        hp = if heston_ts !== nothing
+            lookup_heston_params(heston_ts, tk, date)
+        else
+            nothing
+        end
+
+        fallback_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
             get(rolling_iv[tk], date, σ_rv)
         else
             σ_rv
@@ -332,6 +367,12 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
             sv += slot.shares_held * p
             if slot.option !== nothing
                 T = max(Dates.value(slot.option.expiry - date) / 365.0, 0.0)
+                pricing_vol = if hp !== nothing && T > 0.0
+                    heston_iv_for_option(p, slot.option.strike, T, config.risk_free_rate,
+                                          hp; q=q, option_type=slot.option.type)
+                else
+                    fallback_vol
+                end
                 opt_val = option_price(p, slot.option.strike, T, config.risk_free_rate,
                                        pricing_vol, slot.option.type;
                                        steps=config.crr_steps, q=q)
@@ -384,14 +425,16 @@ end
     run_backtest!(portfolio, price_data, div_data, vol_map, trading_days; ...)
 
 Day-by-day Wheel strategy simulation with risk overlays, position limits,
-and IV calibration.
+and IV calibration. When heston_ts is provided, per-option IV is computed
+from the Heston surface for each specific (S, K, T), capturing skew and
+term structure. Falls back to rolling_iv (flat ATM) when heston_ts is absent.
 """
 function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame},
                        div_data::Dict{String, DataFrame}, vol_map::Dict{String, Float64},
                        trading_days::Vector{Date};
                        earnings_cal=nothing, rolling_vol=nothing,
                        sector_map=nothing, div_yields=nothing,
-                       rolling_iv=nothing)
+                       rolling_iv=nothing, heston_ts=nothing)
     config = portfolio.config
     dfee = config.mgmt_fee_annual / 252.0
 
@@ -430,14 +473,18 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
             q = trailing_dividend_yield(ddf, p, date)
 
+            hp = if heston_ts !== nothing
+                lookup_heston_params(heston_ts, tk, date)
+            else
+                nothing
+            end
+
             σ_iv_val = if rolling_iv !== nothing && haskey(rolling_iv, tk)
                 get(rolling_iv[tk], date, NaN)
             else
                 NaN
             end
 
-            # Heston IV drives all option decisions (delta, strike, tenor, roll);
-            # RV is only a fallback when IV is unavailable.
             σ = isnan(σ_iv_val) ? σ_rv : σ_iv_val
 
             pdf_tk = get(price_data, tk, nothing)
@@ -461,11 +508,12 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                     handle_expiry!(state, slot, p, portfolio)
                 end
 
-                if should_roll(slot, date, p, σ, config)
+                if should_roll(slot, date, p, σ, config; heston_params=hp, q=q)
                     roll_option!(state, slot, p, date, σ, config, portfolio;
                                  earnings_cal=earnings_cal, q=q,
                                  near_earn=is_near_earn, drawdown_pct=drawdown_pct,
-                                 σ_iv=σ_iv_val, adv=adv_val)
+                                 σ_iv=σ_iv_val, adv=adv_val,
+                                 heston_params=hp)
                 end
 
                 if slot.option === nothing
@@ -482,7 +530,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                                                        portfolio; earnings_cal=earnings_cal,
                                                        q=q, near_earn=is_near_earn,
                                                        drawdown_pct=drawdown_pct,
-                                                       σ_iv=σ_iv_val, adv=adv_val)
+                                                       σ_iv=σ_iv_val, adv=adv_val,
+                                                       heston_params=hp)
                     end
                 end
 
@@ -493,7 +542,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
         push!(portfolio.daily_records, compute_nav(portfolio, cp, date, vol_map, config;
                                                     rolling_vol=rolling_vol,
                                                     div_data=div_data,
-                                                    rolling_iv=rolling_iv))
+                                                    rolling_iv=rolling_iv,
+                                                    heston_ts=heston_ts))
     end
 end
 

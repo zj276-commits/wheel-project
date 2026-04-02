@@ -44,7 +44,7 @@ function run_portfolio_stress_tests(;
         run_backtest!(pf, stressed_prices, div_data, vol_map, stressed_days;
                       earnings_cal=earnings_cal, rolling_vol=stressed_rolling,
                       sector_map=sector_map, div_yields=div_yields,
-                      rolling_iv=stressed_iv)
+                      rolling_iv=stressed_iv, heston_ts=heston_ts)
 
         recs = pf.daily_records
         isempty(recs) && continue
@@ -214,7 +214,7 @@ function run_robust_mc_simulation(;
         run_backtest!(pf, synth_prices, div_data, vol_map, synth_trading_days;
                       earnings_cal=earnings_cal, rolling_vol=synth_rolling_vol,
                       sector_map=sector_map, div_yields=div_yields,
-                      rolling_iv=synth_iv)
+                      rolling_iv=synth_iv, heston_ts=heston_ts)
 
         recs = pf.daily_records
         isempty(recs) && continue

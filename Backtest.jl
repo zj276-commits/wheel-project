@@ -354,7 +354,7 @@ println("  Running $(length(trading_days)) trading days...\n")
 run_backtest!(portfolio, price_data, div_data, vol_map, trading_days;
               earnings_cal=earnings_cal, rolling_vol=rolling_vol,
               sector_map=sector_map, div_yields=div_yields,
-              rolling_iv=rolling_iv);
+              rolling_iv=rolling_iv, heston_ts=heston_ts);
 
 # PART 4: RESULTS & REPORTING
 
@@ -722,7 +722,7 @@ if RUN_PARAMETER_SWEEP
         run_backtest!(pf, price_data, div_data, vol_map, trading_days;
                       earnings_cal=earnings_cal, rolling_vol=rolling_vol,
                       sector_map=sector_map, div_yields=div_yields,
-                      rolling_iv=rolling_iv)
+                      rolling_iv=rolling_iv, heston_ts=heston_ts)
 
         recs = pf.daily_records
         isempty(recs) && continue
@@ -790,7 +790,8 @@ if RUN_PAPER_PORTFOLIO
         rolling_vol, rolling_iv,
         trading_days, daily_df,
         portfolio,
-        chart_defaults=_CHART_DEFAULTS, yr=YR)
+        chart_defaults=_CHART_DEFAULTS, yr=YR,
+        heston_ts=heston_ts)
 end
 
 println("\n Done. $(YR) Backtest complete.")

@@ -13,6 +13,8 @@ Usage:
     julia calibrate_heston.jl 10         # calibrate every 10 days
 
 The backtest loads this CSV at startup — no hardcoded Heston parameters needed.
+
+Calibrate_heston.jl uses IVData.jl to calibrate the Heston model parameters.
 """
 
 include(joinpath(@__DIR__, "Include.jl"))
@@ -154,7 +156,8 @@ for tk in sort(collect(keys(opt_by_ticker_date)))
         opt_data = [(K=r.K, T=r.T, market_price=r.mid, option_type=r.otype) for r in sample]
 
         try
-            best = calibrate_heston_from_options(S_est, R, opt_data)
+            #// IVData.jl: Calibrate the Heston model parameters from the option data
+            best = calibrate_heston_from_options(S_est, R, opt_data) 
             push!(results, (ticker=tk, date=ds,
                             v0=best.v0, kappa=best.kappa, theta=best.theta,
                             xi=best.xi, rho=best.rho))
