@@ -25,7 +25,7 @@ function run_paper_portfolio_validation(;
         portfolio,
         chart_defaults, yr::String,
         heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
-        vix_regime::Dict{Date, Float64}=Dict{Date, Float64}())
+        rv_regime::Dict{String, Dict{Date, Float64}}=Dict{String, Dict{Date, Float64}}())
 
     println("\n--- Part 8: Paper/Shadow Portfolio — 60-Day Validation (PDF §7C) ---\n")
 
@@ -57,7 +57,7 @@ function run_paper_portfolio_validation(;
                   earnings_cal=earnings_cal, rolling_vol=rolling_vol,
                   sector_map=sector_map,
                   rolling_iv=rolling_iv,
-                  heston_ts=heston_ts, vix_regime=vix_regime)
+                  heston_ts=heston_ts, rv_regime=rv_regime)
 
     paper_recs = paper_pf.daily_records
     if isempty(paper_recs)

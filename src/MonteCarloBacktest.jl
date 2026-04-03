@@ -12,13 +12,14 @@ Reports final NAV, return, Sharpe, MaxDD, and premium for each scenario.
 Also runs single-ticker stress + earnings-jump GBM for representative tickers.
 """
 function run_portfolio_stress_tests(;
-        price_data, div_data, vol_map, vix_data,
+        price_data, div_data, vol_map,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
         earnings_cal, sector_map,
         safe_tickers, aggressive_tickers,
         chart_defaults,
-        heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}())
+        heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
+        rolling_vol::Dict{String, Dict{Date, Float64}}=Dict{String, Dict{Date, Float64}}())
 
     println("\n--- Part 6: Portfolio-Level Stress Tests (PDF §7B) ---\n")
 
@@ -40,12 +41,13 @@ function run_portfolio_stress_tests(;
         stressed_days = get_trading_days(stressed_prices)
 
         stressed_iv = build_heston_iv_map(stressed_prices, stressed_days;
-                                           r=0.045, heston_ts=heston_ts, vix_data=vix_data)
+                                           r=0.045, heston_ts=heston_ts, rolling_vol=stressed_rolling)
+        stressed_rv_regime = compute_stock_rv_regime(stressed_rolling)
         run_backtest!(pf, stressed_prices, div_data, vol_map, stressed_days;
                       earnings_cal=earnings_cal, rolling_vol=stressed_rolling,
                       sector_map=sector_map,
                       rolling_iv=stressed_iv,
-                      heston_ts=heston_ts)
+                      heston_ts=heston_ts, rv_regime=stressed_rv_regime)
 
         recs = pf.daily_records
         isempty(recs) && continue
@@ -111,7 +113,7 @@ Part 7: Monte Carlo robust simulation.
 - 7e: Single-ticker Heston regime + earnings jump analysis
 """
 function run_robust_mc_simulation(;
-        price_data, div_data, vol_map, vix_data,
+        price_data, div_data, vol_map,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
         earnings_cal, sector_map,
@@ -119,6 +121,7 @@ function run_robust_mc_simulation(;
         safe_tickers, aggressive_tickers,
         chart_defaults, yr::String,
         heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
+        rolling_vol::Dict{String, Dict{Date, Float64}}=Dict{String, Dict{Date, Float64}}(),
         n_mc_runs::Int=20)
 
     println("\n--- Part 7: Monte Carlo Robust Simulation (PDF §7B) ---\n")
@@ -201,7 +204,7 @@ function run_robust_mc_simulation(;
         isempty(synth_trading_days) && continue
 
         synth_iv = build_heston_iv_map(synth_prices, synth_trading_days;
-                                        r=0.045, heston_ts=heston_ts, vix_data=vix_data)
+                                        r=0.045, heston_ts=heston_ts, rolling_vol=synth_rolling_vol)
 
         synth_p1 = Dict(tk => df.adj_close[1]
                         for (tk, df) in synth_prices if nrow(df) > 0)
@@ -212,11 +215,12 @@ function run_robust_mc_simulation(;
         mc_sl = sleeves[v_mask]
 
         pf = initialize_portfolio(valid_tks, mc_sl, mc_w, initial_nav, synth_p1, config)
+        synth_rv_regime = compute_stock_rv_regime(synth_rolling_vol)
         run_backtest!(pf, synth_prices, div_data, vol_map, synth_trading_days;
                       earnings_cal=earnings_cal, rolling_vol=synth_rolling_vol,
                       sector_map=sector_map,
                       rolling_iv=synth_iv,
-                      heston_ts=heston_ts)
+                      heston_ts=heston_ts, rv_regime=synth_rv_regime)
 
         recs = pf.daily_records
         isempty(recs) && continue

@@ -10,7 +10,7 @@ Polygon columns → our columns:
   close → adj_close (Polygon prices are already split-adjusted)
   volume_weighted_average_price, number_of_transactions → dropped
 
-VXX (iPath VIX ETN) is used as the VIX proxy.
+VXX (iPath VIX ETN) can be downloaded as a market volatility reference.
 Dividend data still uses cached CSVs from prior YFinance downloads.
 """
 

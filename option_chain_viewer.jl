@@ -56,23 +56,23 @@ function compute_rolling_vol_single(ticker::String; window::Int=30)::Float64
     end
 end
 
-function get_vxx_regime()::Float64
+function get_stock_rv_regime(ticker::String)::Float64
     try
-        vxx_df = download_price_data("VXX", Date(2025, 1, 1), Date(2025, 12, 31); cache_year=2025)
-        nrow(vxx_df) < 60 && return NaN
-        prices = vxx_df.close
-        window = 20
+        df = download_price_data(ticker, Date(2024, 1, 1), Date(2025, 12, 31); cache_year=2025)
+        nrow(df) < 60 && return 1.0
+        prices = df.adj_close
+        window = 30
         rv_series = Float64[]
         for i in (window+1):length(prices)
             lr = log.(prices[(i-window+1):i] ./ prices[(i-window):(i-1)])
             push!(rv_series, std(lr) * sqrt(252))
         end
-        isempty(rv_series) && return NaN
+        isempty(rv_series) && return 1.0
         med = median(rv_series)
         latest = rv_series[end]
         return clamp(latest / max(med, 0.01), 0.5, 2.0)
     catch
-        return NaN
+        return 1.0
     end
 end
 
@@ -107,11 +107,7 @@ function display_chain(ticker::String, tenor_days::Int)
         println("  Insufficient price history for $ticker (need 31+ days for rolling vol)")
         return
     end
-    vxx_regime = get_vxx_regime()
-    if isnan(vxx_regime)
-        println("  VXX data unavailable — cannot calibrate Heston model")
-        return
-    end
+    rv_regime = get_stock_rv_regime(ticker)
     q = get_dividend_yield(ticker)
     T = tenor_days / 365.0
 
@@ -120,7 +116,7 @@ function display_chain(ticker::String, tenor_days::Int)
         println("  No Heston calibration for $ticker — run `julia calibrate_heston.jl` first")
         return
     end
-    params = vix_adjusted_params(raw_params, vxx_regime)
+    params = rv_adjusted_params(raw_params, rv_regime)
 
     strikes = Float64[]
     for δ in DELTA_TARGETS
@@ -171,8 +167,8 @@ function display_chain(ticker::String, tenor_days::Int)
     println()
     println("="^130)
     println("  $ticker Option Chain | Spot: \$$(round(S, digits=2)) | Tenor: $(tenor_days)d | Sleeve: $sleeve")
-    println("  Heston: v0=$(round(raw_params.v0, digits=4))→$(round(params.v0, digits=4)) (×$(round(vxx_regime, digits=2))) κ=$(params.kappa) θ=$(round(params.theta, digits=4)) ξ=$(params.xi) ρ=$(params.rho)")
-    println("  RV: $(round(σ_rv*100, digits=1))% | VIX regime: $(round(vxx_regime, digits=2))x | Div Yield: $(round(q*100, digits=2))%")
+    println("  Heston: v0=$(round(raw_params.v0, digits=4))→$(round(params.v0, digits=4)) (×$(round(rv_regime, digits=2))) κ=$(params.kappa) θ=$(round(params.theta, digits=4)) ξ=$(params.xi) ρ=$(params.rho)")
+    println("  RV: $(round(σ_rv*100, digits=1))% | RV regime: $(round(rv_regime, digits=2))x | Div Yield: $(round(q*100, digits=2))%")
     println("="^130)
 
     widths = [9, 7, 8, 8, 8, 7, 8, 8, 8, 8, 7, 8, 10, 8]
@@ -219,13 +215,6 @@ function main_loop()
 
             if ticker == "ALL"
                 println("\n  ATM IV Summary (30-day, Heston model):")
-                vxx_r = get_vxx_regime()
-                if isnan(vxx_r)
-                    println("    VXX data unavailable — cannot compute Heston IV")
-                    println()
-                    continue
-                end
-                println("    VIX regime: $(round(vxx_r, digits=2))x")
                 for tk in TICKERS
                     S = load_latest_price(tk)
                     isnan(S) && continue
@@ -236,9 +225,10 @@ function main_loop()
                     if raw_p === nothing
                         println("    $tk: ⚠ no calibration"); continue
                     end
-                    adj_p = vix_adjusted_params(raw_p, vxx_r)
+                    tk_regime = get_stock_rv_regime(tk)
+                    adj_p = rv_adjusted_params(raw_p, tk_regime)
                     atm_iv = heston_implied_vol(S, S, 30.0/365.0, R, adj_p; option_type=:put)
-                    println("    $tk: Spot=\$$(round(S, digits=2))  RV=$(round(σ_rv*100, digits=1))%  HestonIV=$(round(atm_iv*100, digits=1))%  [$sl]")
+                    println("    $tk: Spot=\$$(round(S, digits=2))  RV=$(round(σ_rv*100, digits=1))%  HestonIV=$(round(atm_iv*100, digits=1))%  regime=$(round(tk_regime, digits=2))x  [$sl]")
                 end
                 println()
                 continue

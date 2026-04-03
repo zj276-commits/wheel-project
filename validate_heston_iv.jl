@@ -57,19 +57,12 @@ for (tk, df) in price_data
 end
 println("  Price data: $(length(price_lookup)) tickers")
 
-# ── Step 3: Load VXX for VIX regime ─────────────────────────────────────────
+# ── Step 3: Compute per-stock RV regime ──────────────────────────────────────
 
-println("\n  Step 3: Loading VXX for VIX regime adjustment...")
-vix_regime = Dict{Date, Float64}()
-try
-    vxx_raw = download_all_prices(["VXX"], cal_start, cal_end; cache_year=2025)
-    if haskey(vxx_raw, "VXX") && nrow(vxx_raw["VXX"]) > 20
-        vix_regime = compute_vix_regime_series(vxx_raw["VXX"])
-        println("  VIX regime: $(length(vix_regime)) days")
-    end
-catch e
-    @warn "Could not load VXX: $e — running without VIX adjustment"
-end
+println("\n  Step 3: Computing per-stock RV regime...")
+stock_rolling_vol = compute_rolling_volatility(price_data; window=30)
+rv_regime = compute_stock_rv_regime(stock_rolling_vol)
+println("  Per-stock RV regime: $(length(rv_regime)) tickers")
 
 # ── Step 4: Stream WRDS IV surface, compute Heston IV for each sample ───────
 
@@ -121,8 +114,9 @@ open(WRDS_IV_FILE, "r") do f
         raw_params = lookup_heston_params(heston_ts, tk, dt)
         raw_params === nothing && (skipped_no_heston += 1; continue)
 
-        regime_scale = get(vix_regime, dt, 1.0)
-        params = vix_adjusted_params(raw_params, regime_scale)
+        tk_rv = get(rv_regime, tk, Dict{Date, Float64}())
+        regime_scale = get(tk_rv, dt, 1.0)
+        params = rv_adjusted_params(raw_params, regime_scale)
 
         T = dte_raw / 365.0
         abs_delta = abs(delta_raw)

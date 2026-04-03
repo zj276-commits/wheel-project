@@ -9,7 +9,7 @@ Model:
   Corr(dW₁, dW₂) = ρ
 
 Parameters:
-  v₀  — current instantaneous variance (daily-updated from VIX signal)
+  v₀  — current instantaneous variance (daily-adjusted by per-stock RV regime)
   κ   — mean-reversion speed of variance (from rolling calibration)
   θ   — long-run variance level (from rolling calibration)
   ξ   — vol-of-vol (from rolling calibration)
@@ -17,9 +17,9 @@ Parameters:
 
 Calibration architecture:
   - κ, θ, ξ, ρ: slow-moving parameters from `calibrate_heston.jl` (every N days)
-  - v₀: updated daily using VIX (VXX proxy) signal to reflect current market fear
-    v₀_live = v₀_calibrated × vix_regime,  where
-    vix_regime = current_VXX_RV / expanding_median_VXX_RV  ∈ [0.5, 2.0]
+  - v₀: updated daily using each stock's own realized volatility regime
+    v₀_live = v₀_calibrated × rv_regime(ticker, date),  where
+    rv_regime = σ_rv(today) / expanding_median(σ_rv)  ∈ [0.5, 2.0]
 
 Reference: Heston (1993) "A Closed-Form Solution for Options with
 Stochastic Volatility with Applications to Bond and Currency Options"
@@ -286,78 +286,79 @@ function generate_iv_surface(S::Float64, r::Float64, params::HestonParams;
 end
 
 """
-    compute_vix_regime_series(vix_df; window=20) -> Dict{Date, Float64}
+    compute_stock_rv_regime(rolling_vol) -> Dict{String, Dict{Date, Float64}}
 
-Compute a daily VIX regime multiplier from VXX (iPath VIX ETN) price data.
+Compute a per-stock daily regime multiplier from each ticker's own rolling
+realized volatility.
 
-For each trading day, computes VXX's trailing `window`-day realized volatility
-and divides by the expanding historical median. The result is clamped to [0.5, 2.0].
+For each (ticker, date):
+  regime = σ_rv(date) / expanding_median(σ_rv, start..date)
+  clamped to [0.5, 2.0]
 
-  regime > 1.0 → market more fearful than usual → scale v₀ up
-  regime < 1.0 → market calmer than usual → scale v₀ down
-  regime ≈ 1.0 → normal conditions
+  regime > 1.0 → stock is more volatile than its own historical norm → scale v₀ up
+  regime < 1.0 → stock is calmer than usual → scale v₀ down
+  regime ≈ 1.0 → normal conditions for this stock
+
+Unlike VIX-based regime, this is stock-specific: NVDA and KO each get
+their own regime based on their own volatility history.
 """
-function compute_vix_regime_series(vix_df::DataFrame; window::Int=20)::Dict{Date, Float64}
-    nrow(vix_df) < window + 1 && return Dict{Date, Float64}()
+function compute_stock_rv_regime(rolling_vol::Dict{String, Dict{Date, Float64}})::Dict{String, Dict{Date, Float64}}
+    result = Dict{String, Dict{Date, Float64}}()
 
-    prices = vix_df.close
-    dates = vix_df.date
+    for (tk, vol_dict) in rolling_vol
+        isempty(vol_dict) && continue
+        sorted_dates = sort(collect(keys(vol_dict)))
+        rv_vals = [vol_dict[d] for d in sorted_dates]
 
-    rv_series = Float64[]
-    rv_dates = Date[]
-    for i in (window+1):length(prices)
-        lr = log.(prices[(i-window+1):i] ./ prices[(i-window):(i-1)])
-        push!(rv_series, std(lr) * sqrt(252))
-        push!(rv_dates, dates[i])
-    end
-
-    isempty(rv_series) && return Dict{Date, Float64}()
-
-    result = Dict{Date, Float64}()
-    for (j, d) in enumerate(rv_dates)
-        expanding_med = median(rv_series[1:j])
-        regime = clamp(rv_series[j] / max(expanding_med, 0.01), 0.5, 2.0)
-        result[d] = regime
+        tk_regime = Dict{Date, Float64}()
+        for (j, d) in enumerate(sorted_dates)
+            expanding_med = median(rv_vals[1:j])
+            regime = clamp(rv_vals[j] / max(expanding_med, 0.01), 0.5, 2.0)
+            tk_regime[d] = regime
+        end
+        result[tk] = tk_regime
     end
 
     return result
 end
 
 """
-    vix_adjusted_params(params, vix_regime) -> HestonParams
+    rv_adjusted_params(params, regime_scale) -> HestonParams
 
-Return a copy of `params` with v₀ scaled by the VIX regime multiplier.
+Return a copy of `params` with v₀ scaled by the per-stock RV regime multiplier.
 κ, θ, ξ, ρ remain unchanged (slow-moving, from periodic calibration).
 """
-function vix_adjusted_params(params::HestonParams, vix_regime::Float64)::HestonParams
-    return HestonParams(params.v0 * vix_regime, params.kappa, params.theta, params.xi, params.rho)
+function rv_adjusted_params(params::HestonParams, regime_scale::Float64)::HestonParams
+    return HestonParams(params.v0 * regime_scale, params.kappa, params.theta, params.xi, params.rho)
 end
 
 """
     build_heston_iv_map(price_data, trading_days;
-                         r, heston_ts, vix_data) -> Dict{String, Dict{Date, Float64}}
+                         r, heston_ts, rolling_vol) -> Dict{String, Dict{Date, Float64}}
 
 Build rolling IV map using pre-calibrated Heston parameters from
-`calibrate_heston.jl`, with v₀ daily-adjusted by the VIX regime signal.
+`calibrate_heston.jl`, with v₀ daily-adjusted by each stock's own
+realized volatility regime.
 
 κ, θ, ξ, ρ come from `heston_params.csv` (calibrated every N trading days).
-v₀ is scaled each day by the VIX regime multiplier derived from VXX data:
-    v₀_live = v₀_calibrated × vix_regime(date)
+v₀ is scaled each day by the per-stock RV regime:
+    v₀_live = v₀_calibrated × rv_regime(ticker, date)
 """
 function build_heston_iv_map(price_data::Dict{String, DataFrame},
                                trading_days::Vector{Date};
                                r::Float64=0.045,
                                heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
-                               vix_data::Union{Nothing, DataFrame}=nothing
+                               rolling_vol::Dict{String, Dict{Date, Float64}}=Dict{String, Dict{Date, Float64}}()
                                )::Dict{String, Dict{Date, Float64}}
-    vix_regime = if vix_data !== nothing && nrow(vix_data) > 20
-        series = compute_vix_regime_series(vix_data)
-        if !isempty(series)
-            println("  VIX regime series: $(length(series)) days, range [$(round(minimum(values(series)), digits=2)), $(round(maximum(values(series)), digits=2))]")
+    rv_regime = if !isempty(rolling_vol)
+        regime = compute_stock_rv_regime(rolling_vol)
+        n_stocks = length(regime)
+        if n_stocks > 0
+            println("  Per-stock RV regime: $(n_stocks) tickers")
         end
-        series
+        regime
     else
-        Dict{Date, Float64}()
+        Dict{String, Dict{Date, Float64}}()
     end
 
     result = Dict{String, Dict{Date, Float64}}()
@@ -365,13 +366,14 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
     for (tk, tk_df) in price_data
         !haskey(heston_ts, tk) && continue
         iv_dict = Dict{Date, Float64}()
+        tk_rv = get(rv_regime, tk, Dict{Date, Float64}())
 
         for d in trading_days
             params = lookup_heston_params(heston_ts, tk, d)
             params === nothing && continue
 
-            regime_scale = get(vix_regime, d, 1.0)
-            adjusted = vix_adjusted_params(params, regime_scale)
+            regime_scale = get(tk_rv, d, 1.0)
+            adjusted = rv_adjusted_params(params, regime_scale)
 
             S = get_price_on_date(tk_df, d)
             if S !== nothing && S > 0.0
@@ -392,8 +394,8 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
         missing_tks = [tk for tk in keys(price_data) if !haskey(result, tk)]
         @warn "Tickers without Heston calibration (no IV generated): $missing_tks"
     end
-    vix_status = isempty(vix_regime) ? "no VIX adjustment" : "VIX-adjusted v₀"
-    println("  Heston IV map: $(n_done)/$(n_total) tickers ($(vix_status))")
+    rv_status = isempty(rv_regime) ? "no RV adjustment" : "per-stock RV-adjusted v₀"
+    println("  Heston IV map: $(n_done)/$(n_total) tickers ($(rv_status))")
     return result
 end
 

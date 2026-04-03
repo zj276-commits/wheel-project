@@ -217,19 +217,6 @@ end
 
 rolling_vol = compute_rolling_volatility(price_data; window=30);
 
-# ── 2f: Load VXX (VIX proxy) for daily v₀ adjustment ─────────────────────
-
-vix_data = nothing
-try
-    vxx_raw = download_all_prices(["VXX"], start_date, end_date; cache_year=BACKTEST_YEAR)
-    if haskey(vxx_raw, "VXX") && nrow(vxx_raw["VXX"]) > 0
-        global vix_data = vxx_raw["VXX"]
-        println("  VXX data: $(nrow(vix_data)) days, range [$(round(minimum(vix_data.close), digits=1)), $(round(maximum(vix_data.close), digits=1))]")
-    end
-catch e
-    @warn "Could not load VXX: $e"
-end
-
 # ── 2f: Load Heston calibration (from calibrate_heston.jl) ────────────────
 
 sleeves_map = Dict{String, String}(
@@ -249,14 +236,10 @@ end
 
 # ── 2g: Implied volatility — Heston stochastic volatility model ───────────
 
-println("  Building Heston IV map (VIX-adjusted v₀)...")
-vix_regime_series = if vix_data !== nothing && nrow(vix_data) > 20
-    compute_vix_regime_series(vix_data)
-else
-    Dict{Date, Float64}()
-end
+println("  Building Heston IV map (per-stock RV-adjusted v₀)...")
+rv_regime_map = compute_stock_rv_regime(rolling_vol)
 rolling_iv = build_heston_iv_map(price_data, trading_days;
-                                   r=0.045, heston_ts=heston_ts, vix_data=vix_data)
+                                   r=0.045, heston_ts=heston_ts, rolling_vol=rolling_vol)
 println("  Heston IV map: $(length(rolling_iv)) tickers total")
 
 # ── 2h: Load earnings calendar ──────────────────────────────────────────────
@@ -362,7 +345,7 @@ run_backtest!(portfolio, price_data, div_data, vol_map, trading_days;
               earnings_cal=earnings_cal, rolling_vol=rolling_vol,
               sector_map=sector_map,
               rolling_iv=rolling_iv,
-              heston_ts=heston_ts, vix_regime=vix_regime_series);
+              heston_ts=heston_ts, rv_regime=rv_regime_map);
 
 # PART 4: RESULTS & REPORTING
 
@@ -731,7 +714,7 @@ if RUN_PARAMETER_SWEEP
                       earnings_cal=earnings_cal, rolling_vol=rolling_vol,
                       sector_map=sector_map,
                       rolling_iv=rolling_iv,
-                      heston_ts=heston_ts, vix_regime=vix_regime_series)
+                      heston_ts=heston_ts, rv_regime=rv_regime_map)
 
         recs = pf.daily_records
         isempty(recs) && continue
@@ -764,27 +747,27 @@ end
 
 if RUN_STRESS_TEST
     run_portfolio_stress_tests(;
-        price_data, div_data, vol_map, vix_data,
+        price_data, div_data, vol_map,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
         earnings_cal, sector_map,
         safe_tickers, aggressive_tickers,
         chart_defaults=_CHART_DEFAULTS,
-        heston_ts=heston_ts)
+        heston_ts=heston_ts, rolling_vol=rolling_vol)
 end
 
 # PART 7 (optional): MONTE CARLO ROBUST SIMULATION (Varner PDF §7B)
 
 if RUN_ROBUST_MC
     run_robust_mc_simulation(;
-        price_data, div_data, vol_map, vix_data,
+        price_data, div_data, vol_map,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
         earnings_cal, sector_map,
         trading_days, daily_df,
         safe_tickers, aggressive_tickers,
         chart_defaults=_CHART_DEFAULTS, yr=YR,
-        heston_ts=heston_ts,
+        heston_ts=heston_ts, rolling_vol=rolling_vol,
         n_mc_runs=20)
 end
 
@@ -800,7 +783,7 @@ if RUN_PAPER_PORTFOLIO
         trading_days, daily_df,
         portfolio,
         chart_defaults=_CHART_DEFAULTS, yr=YR,
-        heston_ts=heston_ts, vix_regime=vix_regime_series)
+        heston_ts=heston_ts, rv_regime=rv_regime_map)
 end
 
 println("\n Done. $(YR) Backtest complete.")
