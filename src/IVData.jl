@@ -1,9 +1,7 @@
 """
 Heston Stochastic Volatility Model — IV Surface Generation
 
-All IV is model-derived via the Heston (1993) framework, calibrated from
-VIX + realized vol. No external IV data sources (WRDS, OptionMetrics, etc.)
-are used. The system is forward-looking and applicable to any tenor.
+All IV is model-derived via the Heston (1993) framework.
 
 Model:
   dS = μ S dt + √v S dW₁
@@ -11,17 +9,17 @@ Model:
   Corr(dW₁, dW₂) = ρ
 
 Parameters:
-  v₀  — current instantaneous variance (calibrated from VIX or recent RV)
-  κ   — mean-reversion speed of variance
-  θ   — long-run variance level
-  ξ   — vol-of-vol (volatility of the variance process)
-  ρ   — correlation between stock and variance (typically negative for equities)
+  v₀  — current instantaneous variance (daily-updated from VIX signal)
+  κ   — mean-reversion speed of variance (from rolling calibration)
+  θ   — long-run variance level (from rolling calibration)
+  ξ   — vol-of-vol (from rolling calibration)
+  ρ   — correlation between stock and variance (from rolling calibration)
 
-Calibration sources:
-  - VIX index → proxy for √(30-day expected variance), sets v₀
-  - Historical realized vol → sets θ (long-run level)
-  - Option prices (when available) → refine κ, ξ, ρ via least-squares
-  - Fallback: empirical defaults by sleeve type
+Calibration architecture:
+  - κ, θ, ξ, ρ: slow-moving parameters from `calibrate_heston.jl` (every N days)
+  - v₀: updated daily using VIX (VXX proxy) signal to reflect current market fear
+    v₀_live = v₀_calibrated × vix_regime,  where
+    vix_regime = current_VXX_RV / expanding_median_VXX_RV  ∈ [0.5, 2.0]
 
 Reference: Heston (1993) "A Closed-Form Solution for Options with
 Stochastic Volatility with Applications to Bond and Currency Options"
@@ -288,20 +286,80 @@ function generate_iv_surface(S::Float64, r::Float64, params::HestonParams;
 end
 
 """
+    compute_vix_regime_series(vix_df; window=20) -> Dict{Date, Float64}
+
+Compute a daily VIX regime multiplier from VXX (iPath VIX ETN) price data.
+
+For each trading day, computes VXX's trailing `window`-day realized volatility
+and divides by the expanding historical median. The result is clamped to [0.5, 2.0].
+
+  regime > 1.0 → market more fearful than usual → scale v₀ up
+  regime < 1.0 → market calmer than usual → scale v₀ down
+  regime ≈ 1.0 → normal conditions
+"""
+function compute_vix_regime_series(vix_df::DataFrame; window::Int=20)::Dict{Date, Float64}
+    nrow(vix_df) < window + 1 && return Dict{Date, Float64}()
+
+    prices = vix_df.close
+    dates = vix_df.date
+
+    rv_series = Float64[]
+    rv_dates = Date[]
+    for i in (window+1):length(prices)
+        lr = log.(prices[(i-window+1):i] ./ prices[(i-window):(i-1)])
+        push!(rv_series, std(lr) * sqrt(252))
+        push!(rv_dates, dates[i])
+    end
+
+    isempty(rv_series) && return Dict{Date, Float64}()
+
+    result = Dict{Date, Float64}()
+    for (j, d) in enumerate(rv_dates)
+        expanding_med = median(rv_series[1:j])
+        regime = clamp(rv_series[j] / max(expanding_med, 0.01), 0.5, 2.0)
+        result[d] = regime
+    end
+
+    return result
+end
+
+"""
+    vix_adjusted_params(params, vix_regime) -> HestonParams
+
+Return a copy of `params` with v₀ scaled by the VIX regime multiplier.
+κ, θ, ξ, ρ remain unchanged (slow-moving, from periodic calibration).
+"""
+function vix_adjusted_params(params::HestonParams, vix_regime::Float64)::HestonParams
+    return HestonParams(params.v0 * vix_regime, params.kappa, params.theta, params.xi, params.rho)
+end
+
+"""
     build_heston_iv_map(price_data, trading_days;
-                         r, heston_ts) -> Dict{String, Dict{Date, Float64}}
+                         r, heston_ts, vix_data) -> Dict{String, Dict{Date, Float64}}
 
 Build rolling IV map using pre-calibrated Heston parameters from
-`calibrate_heston.jl`. For each (ticker, date), look up the most recent
-calibration and extract ATM 30-day put IV.
+`calibrate_heston.jl`, with v₀ daily-adjusted by the VIX regime signal.
 
-All parameters (v₀, κ, θ, ξ, ρ) come from the calibration — no defaults.
+κ, θ, ξ, ρ come from `heston_params.csv` (calibrated every N trading days).
+v₀ is scaled each day by the VIX regime multiplier derived from VXX data:
+    v₀_live = v₀_calibrated × vix_regime(date)
 """
 function build_heston_iv_map(price_data::Dict{String, DataFrame},
                                trading_days::Vector{Date};
                                r::Float64=0.045,
-                               heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}()
+                               heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
+                               vix_data::Union{Nothing, DataFrame}=nothing
                                )::Dict{String, Dict{Date, Float64}}
+    vix_regime = if vix_data !== nothing && nrow(vix_data) > 20
+        series = compute_vix_regime_series(vix_data)
+        if !isempty(series)
+            println("  VIX regime series: $(length(series)) days, range [$(round(minimum(values(series)), digits=2)), $(round(maximum(values(series)), digits=2))]")
+        end
+        series
+    else
+        Dict{Date, Float64}()
+    end
+
     result = Dict{String, Dict{Date, Float64}}()
 
     for (tk, tk_df) in price_data
@@ -312,11 +370,14 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
             params = lookup_heston_params(heston_ts, tk, d)
             params === nothing && continue
 
+            regime_scale = get(vix_regime, d, 1.0)
+            adjusted = vix_adjusted_params(params, regime_scale)
+
             S = get_price_on_date(tk_df, d)
             if S !== nothing && S > 0.0
-                iv_dict[d] = heston_implied_vol(Float64(S), Float64(S), 30.0/365.0, r, params; option_type=:put)
+                iv_dict[d] = heston_implied_vol(Float64(S), Float64(S), 30.0/365.0, r, adjusted; option_type=:put)
             else
-                iv_dict[d] = sqrt(params.v0)
+                iv_dict[d] = sqrt(adjusted.v0)
             end
         end
 
@@ -331,7 +392,8 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
         missing_tks = [tk for tk in keys(price_data) if !haskey(result, tk)]
         @warn "Tickers without Heston calibration (no IV generated): $missing_tks"
     end
-    println("  Heston IV map: $(n_done)/$(n_total) tickers")
+    vix_status = isempty(vix_regime) ? "no VIX adjustment" : "VIX-adjusted v₀"
+    println("  Heston IV map: $(n_done)/$(n_total) tickers ($(vix_status))")
     return result
 end
 

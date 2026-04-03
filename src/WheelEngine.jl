@@ -344,8 +344,6 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         σ_rv = _resolve_vol(rolling_vol, vol_map, tk, date)
         q = if div_data !== nothing && haskey(div_data, tk)
             trailing_dividend_yield(div_data[tk], p, date)
-        elseif div_yields !== nothing
-            get(div_yields, tk, 0.0)
         else
             0.0
         end
@@ -359,7 +357,7 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         fallback_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
             get(rolling_iv[tk], date, σ_rv)
         else
-            σ_rv
+            nothing
         end
 
         bav += state.block_a_shares * p

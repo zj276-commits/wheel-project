@@ -15,7 +15,7 @@ function run_portfolio_stress_tests(;
         price_data, div_data, vol_map, vix_data,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         safe_tickers, aggressive_tickers,
         chart_defaults,
         heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}())
@@ -40,7 +40,7 @@ function run_portfolio_stress_tests(;
         stressed_days = get_trading_days(stressed_prices)
 
         stressed_iv = build_heston_iv_map(stressed_prices, stressed_days;
-                                           r=0.045, heston_ts=heston_ts)
+                                           r=0.045, heston_ts=heston_ts, vix_data=vix_data)
         run_backtest!(pf, stressed_prices, div_data, vol_map, stressed_days;
                       earnings_cal=earnings_cal, rolling_vol=stressed_rolling,
                       sector_map=sector_map, div_yields=div_yields,
@@ -113,7 +113,7 @@ function run_robust_mc_simulation(;
         price_data, div_data, vol_map, vix_data,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         trading_days, daily_df,
         safe_tickers, aggressive_tickers,
         chart_defaults, yr::String,
@@ -200,7 +200,7 @@ function run_robust_mc_simulation(;
         isempty(synth_trading_days) && continue
 
         synth_iv = build_heston_iv_map(synth_prices, synth_trading_days;
-                                        r=0.045, heston_ts=heston_ts)
+                                        r=0.045, heston_ts=heston_ts, vix_data=vix_data)
 
         synth_p1 = Dict(tk => df.adj_close[1]
                         for (tk, df) in synth_prices if nrow(df) > 0)

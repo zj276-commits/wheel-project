@@ -19,7 +19,7 @@ function run_paper_portfolio_validation(;
         price_data, div_data, vol_map,
         all_tickers, sleeves, weights,
         initial_nav, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         rolling_vol, rolling_iv,
         trading_days, daily_df,
         portfolio,   # the full-year backtest portfolio (for comparison)

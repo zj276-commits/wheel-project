@@ -216,9 +216,8 @@ end
 # ── 2e: Compute rolling volatility & dividend yields ────────────────────────
 
 rolling_vol = compute_rolling_volatility(price_data; window=30);
-div_yields = compute_dividend_yields(div_data, price_data);
 
-# ── 2f: Load VXX (VIX proxy) for Heston calibration ───────────────────────
+# ── 2f: Load VXX (VIX proxy) for daily v₀ adjustment ─────────────────────
 
 vix_data = nothing
 try
@@ -250,9 +249,14 @@ end
 
 # ── 2g: Implied volatility — Heston stochastic volatility model ───────────
 
-println("  Building Heston IV map from calibrated params...")
+println("  Building Heston IV map (VIX-adjusted v₀)...")
+vix_regime_series = if vix_data !== nothing && nrow(vix_data) > 20
+    compute_vix_regime_series(vix_data)
+else
+    Dict{Date, Float64}()
+end
 rolling_iv = build_heston_iv_map(price_data, trading_days;
-                                   r=0.045, heston_ts=heston_ts)
+                                   r=0.045, heston_ts=heston_ts, vix_data=vix_data)
 println("  Heston IV map: $(length(rolling_iv)) tickers total")
 
 # ── 2h: Load earnings calendar ──────────────────────────────────────────────
@@ -272,13 +276,16 @@ for (i, tk) in enumerate(all_tickers)
     if !isempty(rv_dict)
         rv_vals = collect(values(rv_dict))
         last_date = maximum(keys(rv_dict))
+        last_price = get_price_on_date(price_data[tk], last_date)
+        ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
+        q_trail = last_price !== nothing ? trailing_dividend_yield(ddf, last_price, last_date) : 0.0
         push!(vol_summary_df, (
             tk, sleeves[i],
             round(rv_dict[last_date]*100, digits=1),
             round(get(iv_dict, last_date, NaN)*100, digits=1),
             round(minimum(rv_vals)*100, digits=1),
             round(maximum(rv_vals)*100, digits=1),
-            round(get(div_yields, tk, 0.0)*100, digits=2)
+            round(q_trail*100, digits=2)
         ))
     end
 end
@@ -758,7 +765,7 @@ if RUN_STRESS_TEST
         price_data, div_data, vol_map, vix_data,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         safe_tickers, aggressive_tickers,
         chart_defaults=_CHART_DEFAULTS,
         heston_ts=heston_ts)
@@ -771,7 +778,7 @@ if RUN_ROBUST_MC
         price_data, div_data, vol_map, vix_data,
         all_tickers, sleeves, weights, sleeves_map,
         initial_nav, prices_day1, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         trading_days, daily_df,
         safe_tickers, aggressive_tickers,
         chart_defaults=_CHART_DEFAULTS, yr=YR,
@@ -786,7 +793,7 @@ if RUN_PAPER_PORTFOLIO
         price_data, div_data, vol_map,
         all_tickers, sleeves, weights,
         initial_nav, config,
-        earnings_cal, sector_map, div_yields,
+        earnings_cal, sector_map,
         rolling_vol, rolling_iv,
         trading_days, daily_df,
         portfolio,
