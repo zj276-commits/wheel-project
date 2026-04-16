@@ -1,20 +1,22 @@
 """
-calibrate_heston.jl — Standalone Heston parameter calibration
+calibrate_heston.jl — Modified Heston parameter calibration
 
 Reads option_prices.csv (real market bid/ask), and for each ticker on every
-Nth trading day, fits (v₀, κ, θ, ξ, ρ) by minimizing SSE between Heston
-model prices and market mid-prices.
+Nth trading day, fits (θ_base, β₁..β₄, γ, κ, σ_v) by minimizing SSE between
+model-predicted IV (= √(θ·ψ)) and market-extracted BS implied volatility.
+
+The model:
+    IV(K, DTE) = √(θ_base · (1+γ·mood) · ψ(β, DTE, K/S))
+where ψ = exp(β₁·ln(DTE) + β₂·ln(K/S) + β₃·ln(DTE)·ln(K/S) + β₄·(ln(K/S))²)
 
 Output: data/heston_params.csv
-    ticker, date, v0, kappa, theta, xi, rho
+    ticker, date, theta_base, beta1, beta2, beta3, beta4, gamma, kappa, sigma_v
 
 Usage:
     julia calibrate_heston.jl            # calibrate every 5 days
     julia calibrate_heston.jl 10         # calibrate every 10 days
 
 The backtest loads this CSV at startup — no hardcoded Heston parameters needed.
-
-Calibrate_heston.jl uses IVData.jl to calibrate the Heston model parameters.
 """
 
 include(joinpath(@__DIR__, "Include.jl"))
@@ -34,7 +36,8 @@ const TARGET_TICKERS = Set([
 cal_interval = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 5
 
 println("═══════════════════════════════════════════════════")
-println("  Heston Parameter Calibration")
+println("  Modified Heston Parameter Calibration")
+println("  Model: IV = √(θ_base · ψ(β, DTE, K/S))")
 println("  Input:    $(OPTION_FILE)")
 println("  Output:   $(OUTPUT_FILE)")
 println("  Interval: every $(cal_interval) trading days")
@@ -115,10 +118,10 @@ println("  Tickers loaded: $(length(opt_by_ticker_date))")
 
 # ── Step 2: For each ticker, rolling calibration ─────────────────────────────
 
-println("\n  Step 2: Rolling calibration...\n")
+println("\n  Step 2: Rolling calibration (modified Heston model)...\n")
 
-results = NamedTuple{(:ticker,:date,:v0,:kappa,:theta,:xi,:rho),
-                      Tuple{String,String,Float64,Float64,Float64,Float64,Float64}}[]
+results = NamedTuple{(:ticker,:date,:theta_base,:beta1,:beta2,:beta3,:beta4,:gamma,:kappa,:sigma_v),
+                      Tuple{String,String,Float64,Float64,Float64,Float64,Float64,Float64,Float64,Float64}}[]
 
 for tk in sort(collect(keys(opt_by_ticker_date)))
     date_strs = sort(collect(keys(opt_by_ticker_date[tk])))
@@ -140,12 +143,7 @@ for tk in sort(collect(keys(opt_by_ticker_date)))
         Ks = [r.K for r in records]
         median_K = median(Ks)
 
-        atm_records = filter(r -> abs(r.K - median_K) / median_K < 0.10, records)
-        if length(atm_records) >= 2
-            S_est = median_K
-        else
-            S_est = median_K
-        end
+        S_est = median_K
 
         sample = if length(records) > 40
             records[sort(randperm(length(records))[1:40])]
@@ -159,8 +157,10 @@ for tk in sort(collect(keys(opt_by_ticker_date)))
             #// IVData.jl: Calibrate the Heston model parameters from the option data
             best = calibrate_heston_from_options(S_est, R, opt_data) 
             push!(results, (ticker=tk, date=ds,
-                            v0=best.v0, kappa=best.kappa, theta=best.theta,
-                            xi=best.xi, rho=best.rho))
+                            theta_base=best.θ_base,
+                            beta1=best.β[1], beta2=best.β[2],
+                            beta3=best.β[3], beta4=best.β[4],
+                            gamma=best.γ, kappa=best.κ, sigma_v=best.σ_v))
             n_cal += 1
         catch e
             continue
@@ -169,7 +169,7 @@ for tk in sort(collect(keys(opt_by_ticker_date)))
 
     if n_cal > 0
         last = results[end]
-        println("    $tk: $(n_cal) calibrations over $(n_dates) dates | last: κ=$(round(last.kappa, digits=2)) θ=$(round(last.theta, digits=4)) ξ=$(round(last.xi, digits=2)) ρ=$(round(last.rho, digits=2))")
+        println("    $tk: $(n_cal) calibrations over $(n_dates) dates | θ=$(round(last.theta_base, digits=4)) β=[$(round(last.beta1,digits=3)),$(round(last.beta2,digits=3)),$(round(last.beta3,digits=3)),$(round(last.beta4,digits=3))]")
     else
         println("    $tk: ⚠ no valid calibrations")
     end
@@ -180,9 +180,9 @@ end
 println("\n  Step 3: Saving results...")
 
 open(OUTPUT_FILE, "w") do f
-    write(f, "ticker,date,v0,kappa,theta,xi,rho\n")
+    write(f, "ticker,date,theta_base,beta1,beta2,beta3,beta4,gamma,kappa,sigma_v\n")
     for r in results
-        write(f, "$(r.ticker),$(r.date),$(r.v0),$(r.kappa),$(r.theta),$(r.xi),$(r.rho)\n")
+        write(f, "$(r.ticker),$(r.date),$(r.theta_base),$(r.beta1),$(r.beta2),$(r.beta3),$(r.beta4),$(r.gamma),$(r.kappa),$(r.sigma_v)\n")
     end
 end
 

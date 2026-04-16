@@ -159,19 +159,6 @@ function option_greeks(S::Float64, K::Float64, T::Float64, r::Float64, σ::Float
     )
 end
 
-# ── Strike from Delta (Bisection) ────────────────────────────────────────────
-# ⚠ SELF-DESIGNED — no direct course or textbook reference.
-# This bridges strategy parameters (delta targets) to option pricing.
-#
-# How it works (plain English):
-#   Input:  "I want to sell a put with |Δ| = 0.25"
-#   Output: "Set the strike at $220" (for a $230 stock)
-#
-#   Method: binary search over K ∈ [0.5×S, 2.0×S].
-#   At each midpoint, compute CRR delta.
-#   If |Δ| is too high → K is too close to S (too ITM) → search lower K.
-#   If |Δ| is too low  → K is too far from S (too OTM) → search higher K.
-#   Converge when K_hi - K_lo < $0.005.
 
 """
     strike_from_delta(S, T, r, σ, target_delta, option_type; N=30, q=0.0) -> Float64
@@ -212,50 +199,6 @@ function strike_from_delta(S::Float64, T::Float64, r::Float64, σ::Float64,
 
     return round((K_lo + K_hi) / 2.0, digits=2)
 end
-
-# ── Implied Volatility Estimation ─────────────────────────────────────────────
-# ⚠ SELF-DESIGNED — CRR-based IV solver for American options.
-# VLQuantitativeFinancePackage has estimate_implied_volatility() for European;
-# this version handles American early exercise via CRR.
-#
-# How it works (plain English):
-#   Input:  "This put is trading at $3.50 in the market"
-#   Output: "The market-implied volatility is σ = 0.32 (32%)"
-#
-#   Method: binary search over σ ∈ [0.01, 3.0].
-#   At each midpoint, price the option via CRR.
-#   If CRR price > market price → σ is too high → search lower σ.
-#   If CRR price < market price → σ is too low  → search higher σ.
-#   Converge when σ_hi - σ_lo < 1e-6.
-
-"""
-    estimate_implied_vol(S, K, T, r, market_price, option_type; q=0.0, N=50) -> Float64
-
-⚠ SELF-DESIGNED (CRR-based alternative to BSM IV solver).
-Estimate implied volatility by bisection on CRR American option price.
-Motivated by Varner PDF Section 7B: "calibrated to each name's IV surface."
-"""
-function estimate_implied_vol(S::Float64, K::Float64, T::Float64, r::Float64,
-                               market_price::Float64, option_type::Symbol;
-                               q::Float64=0.0, N::Int=50)::Float64
-    market_price <= 0.0 && return 0.01
-    T <= 0.0 && return 0.01
-
-    σ_lo, σ_hi = 0.01, 3.0
-    for _ in 1:60
-        σ_mid = (σ_lo + σ_hi) / 2.0
-        model_price = crr_price(S, K, T, r, σ_mid, option_type; N=N, q=q)
-        if model_price > market_price
-            σ_hi = σ_mid
-        else
-            σ_lo = σ_mid
-        end
-        (σ_hi - σ_lo) < 1e-6 && break
-    end
-    return (σ_lo + σ_hi) / 2.0
-end
-
-# ── Unified Pricing API ──────────────────────────────────────────────────────
 
 """
     option_price(S, K, T, r, σ, option_type; steps=50, q=0.0) -> Float64

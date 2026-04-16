@@ -126,10 +126,11 @@ open(WRDS_IV_FILE, "r") do f
         ddf = get(div_data, tk, DataFrame(ex_date=Date[], amount=Float64[]))
         q = trailing_dividend_yield(ddf, S, dt)
 
-        K = strike_from_delta(S, T, R, sqrt(params.v0), abs_delta, opt_type; q=q)
+        atm_iv = heston_iv_for_option(S, S, T, R, params; q=q, option_type=opt_type)
+        K = strike_from_delta(S, T, R, atm_iv, abs_delta, opt_type; q=q)
 
         try
-            heston_iv = heston_implied_vol(S, K, T, R, params; q=q, option_type=opt_type)
+            heston_iv = heston_iv_for_option(S, K, T, R, params; q=q, option_type=opt_type)
             heston_iv <= 0.0 || heston_iv > 5.0 && continue
 
             push!(results, (ticker=tk, date=dt, dte=dte_raw, delta=delta_raw,

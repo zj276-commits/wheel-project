@@ -334,7 +334,8 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
                      config::WheelConfig;
                      rolling_vol=nothing, div_yields=nothing,
                      div_data=nothing, rolling_iv=nothing,
-                     heston_ts=nothing)::DailyRecord
+                     heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
+                     rv_regime::Dict{String, Dict{Date, Float64}}=Dict{String, Dict{Date, Float64}}())::DailyRecord
     sv, omtm, bav, tp, td, tc = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     p_delta, p_gamma, p_vega = 0.0, 0.0, 0.0
 
@@ -348,8 +349,14 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
             0.0
         end
 
-        hp = if heston_ts !== nothing
-            lookup_heston_params(heston_ts, tk, date)
+        hp = if !isempty(heston_ts)
+            raw = lookup_heston_params(heston_ts, tk, date)
+            if raw !== nothing && !isempty(rv_regime)
+                tk_rv = get(rv_regime, tk, Dict{Date, Float64}())
+                rv_adjusted_params(raw, get(tk_rv, date, 1.0))
+            else
+                raw
+            end
         else
             nothing
         end
@@ -357,7 +364,7 @@ function compute_nav(portfolio::Portfolio, prices::Dict{String, Float64},
         fallback_vol = if rolling_iv !== nothing && haskey(rolling_iv, tk)
             get(rolling_iv[tk], date, σ_rv)
         else
-            nothing
+            σ_rv
         end
 
         bav += state.block_a_shares * p
@@ -431,8 +438,10 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                        div_data::Dict{String, DataFrame}, vol_map::Dict{String, Float64},
                        trading_days::Vector{Date};
                        earnings_cal=nothing, rolling_vol=nothing,
-                       sector_map=nothing, div_yields=nothing,
-                       rolling_iv=nothing, heston_ts=nothing)
+                       sector_map=nothing,
+                       rolling_iv=nothing,
+                       heston_ts::Dict{String, Dict{Date, HestonCalibration}}=Dict{String, Dict{Date, HestonCalibration}}(),
+                       rv_regime::Dict{String, Dict{Date, Float64}}=Dict{String, Dict{Date, Float64}}())
     config = portfolio.config
     dfee = config.mgmt_fee_annual / 252.0
 
@@ -482,6 +491,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
             else
                 NaN
             end
+
+
 
             σ = isnan(σ_iv_val) ? σ_rv : σ_iv_val
 
@@ -541,7 +552,8 @@ function run_backtest!(portfolio::Portfolio, price_data::Dict{String, DataFrame}
                                                     rolling_vol=rolling_vol,
                                                     div_data=div_data,
                                                     rolling_iv=rolling_iv,
-                                                    heston_ts=heston_ts))
+                                                    heston_ts=heston_ts,
+                                                    rv_regime=rv_regime))
     end
 end
 

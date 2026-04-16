@@ -118,9 +118,11 @@ function display_chain(ticker::String, tenor_days::Int)
     end
     params = rv_adjusted_params(raw_params, rv_regime)
 
+    atm_iv = heston_iv_for_option(S, S, T, R, params; q=q, option_type=:put)
+
     strikes = Float64[]
     for δ in DELTA_TARGETS
-        K = strike_from_delta(S, T, R, sqrt(params.v0), δ, :put; q=q)
+        K = strike_from_delta(S, T, R, atm_iv, δ, :put; q=q)
         push!(strikes, round(K, digits=2))
     end
     extras = [round(S * m, digits=2) for m in [0.85, 0.90, 0.95, 1.00, 1.05, 1.10]]
@@ -134,10 +136,10 @@ function display_chain(ticker::String, tenor_days::Int)
     for (row, K) in enumerate(all_strikes)
         moneyness = (S - K) / S * 100.0
 
-        put_price = heston_put_price(S, K, T, R, params; q=q)
-        call_price = heston_call_price(S, K, T, R, params; q=q)
-        iv_put = heston_implied_vol(S, K, T, R, params; q=q, option_type=:put)
-        iv_call = heston_implied_vol(S, K, T, R, params; q=q, option_type=:call)
+        iv_put = heston_iv_for_option(S, K, T, R, params; q=q, option_type=:put)
+        iv_call = heston_iv_for_option(S, K, T, R, params; q=q, option_type=:call)
+        put_price = option_price(S, K, T, R, iv_put, :put; q=q)
+        call_price = option_price(S, K, T, R, iv_call, :call; q=q)
 
         spread_pct = 0.02 + 0.01 * (1.0 - min(abs(moneyness) / 20.0, 1.0))
         put_bid = max(put_price * (1.0 - spread_pct), 0.0)
@@ -167,7 +169,7 @@ function display_chain(ticker::String, tenor_days::Int)
     println()
     println("="^130)
     println("  $ticker Option Chain | Spot: \$$(round(S, digits=2)) | Tenor: $(tenor_days)d | Sleeve: $sleeve")
-    println("  Heston: v0=$(round(raw_params.v0, digits=4))→$(round(params.v0, digits=4)) (×$(round(rv_regime, digits=2))) κ=$(params.kappa) θ=$(round(params.theta, digits=4)) ξ=$(params.xi) ρ=$(params.rho)")
+    println("  Heston: θ=$(round(raw_params.θ_base, digits=4))→$(round(params.θ_base, digits=4)) (×$(round(rv_regime, digits=2))) β=$(round.(params.β, digits=3)) κ=$(params.κ) σ_v=$(params.σ_v)")
     println("  RV: $(round(σ_rv*100, digits=1))% | RV regime: $(round(rv_regime, digits=2))x | Div Yield: $(round(q*100, digits=2))%")
     println("="^130)
 
@@ -227,7 +229,7 @@ function main_loop()
                     end
                     tk_regime = get_stock_rv_regime(tk)
                     adj_p = rv_adjusted_params(raw_p, tk_regime)
-                    atm_iv = heston_implied_vol(S, S, 30.0/365.0, R, adj_p; option_type=:put)
+                    atm_iv = heston_iv_for_option(S, S, 30.0/365.0, R, adj_p; option_type=:put)
                     println("    $tk: Spot=\$$(round(S, digits=2))  RV=$(round(σ_rv*100, digits=1))%  HestonIV=$(round(atm_iv*100, digits=1))%  regime=$(round(tk_regime, digits=2))x  [$sl]")
                 end
                 println()

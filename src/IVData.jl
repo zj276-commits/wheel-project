@@ -1,122 +1,683 @@
 """
-Heston Stochastic Volatility Model — IV Surface Generation
+Modified Heston Implied Volatility Model
 
-All IV is model-derived via the Heston (1993) framework.
+Pipeline: JumpHMM synthetic prices → Heston dv variance process → IV → CRR binomial tree → American option prices
 
-Model:
-  dS = μ S dt + √v S dW₁
-  dv = κ(θ - v)dt + ξ√v dW₂
-  Corr(dW₁, dW₂) = ρ
+The key innovation is that the Heston mean-reversion target θ is a hybrid function
+of the JumpHMM state, days to expiration, moneyness, and aggregate market mood:
 
-Parameters:
-  v₀  — current instantaneous variance (daily-adjusted by per-stock RV regime)
-  κ   — mean-reversion speed of variance (from rolling calibration)
-  θ   — long-run variance level (from rolling calibration)
-  ξ   — vol-of-vol (from rolling calibration)
-  ρ   — correlation between stock and variance (from rolling calibration)
+    θ(t) = θ_{s_t} · (1 + γ·M_t) · ψ(DTE, K/S_t)
 
-Calibration architecture:
-  - κ, θ, ξ, ρ: slow-moving parameters from `calibrate_heston.jl` (every N days)
-  - v₀: updated daily using each stock's own realized volatility regime
-    v₀_live = v₀_calibrated × rv_regime(ticker, date),  where
-    rv_regime = σ_rv(today) / expanding_median(σ_rv)  ∈ [0.5, 2.0]
+where ψ = exp(β₁·ln(DTE) + β₂·ln(K/S) + β₃·ln(DTE)·ln(K/S) + β₄·(ln(K/S))²)
 
-Reference: Heston (1993) "A Closed-Form Solution for Options with
-Stochastic Volatility with Applications to Bond and Currency Options"
+Heston variance process:
+    dv = κ(θ(t) - v)dt + σ_v √v dW_v
+
+with reflecting boundary at v = 0 and time-varying θ(t).
+
+Reference: Varner (2025) "Modified Heston Implied Volatility Model"
 """
 
-struct HestonParams
-    v0::Float64     # current instantaneous variance
-    kappa::Float64  # mean-reversion speed
-    theta::Float64  # long-run variance
-    xi::Float64     # vol of vol
-    rho::Float64    # correlation (stock, variance)
+using Random
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Types (from HestonIV/Types.jl)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+"""
+    HestonParameters
+
+Parameters for the Heston stochastic variance process:
+    dv = κ(θ(t) - v)dt + σ_v √v dW_v
+
+- `κ`: mean-reversion speed
+- `σ_v`: vol-of-vol
+
+Note: v₀ is not stored here — it is initialized per (ticker, strike, DTE) as
+v₀ = θ(s₀, DTE, K/S₀, M₀), so the process starts at the mean-reversion target
+for the current regime. This gives each contract its own initial IV automatically.
+"""
+struct HestonParameters
+    κ::Float64
+    σ_v::Float64
 end
 
 """
-Heston characteristic function φ(u) for log-price.
-Used in the semi-analytic pricing formula via numerical integration.
+    ThetaHybrid
+
+Hybrid θ-function: θ(t) = θ_{s_t} · (1 + γ·M_t) · ψ(DTE, K/S_t)
+
+- `θ_states`: vector of θ values, one per HMM state
+- `β`: parameters for ψ (Varner 2025 eq. 11):
+    [β₁, β₂, β₃, β₄, β₅] → ψ = exp(β₁·ln(τ) + β₂·ln(m) + β₃·ln(τ)·ln(m) + β₄·(ln(m))² + β₅·(ln(τ))²)
+    β₁: linear DTE decay
+    β₂: skew (asymmetry)
+    β₃: DTE × skew interaction
+    β₄: smile curvature
+    β₅: DTE curvature (U-shaped ATM term structure)
+- `γ`: market mood sensitivity
 """
-function heston_char_func(u::ComplexF64, S::Float64, K::Float64, T::Float64,
-                           r::Float64, q::Float64, params::HestonParams)::ComplexF64
-    v0, κ, θ, ξ, ρ = params.v0, params.kappa, params.theta, params.xi, params.rho
-
-    d = sqrt((ρ * ξ * im * u - κ)^2 + ξ^2 * (im * u + u^2))
-    g = (κ - ρ * ξ * im * u - d) / (κ - ρ * ξ * im * u + d)
-
-    C = (r - q) * im * u * T +
-        (κ * θ / ξ^2) * ((κ - ρ * ξ * im * u - d) * T - 2.0 * log((1.0 - g * exp(-d * T)) / (1.0 - g)))
-
-    D = ((κ - ρ * ξ * im * u - d) / ξ^2) * ((1.0 - exp(-d * T)) / (1.0 - g * exp(-d * T)))
-
-    return exp(C + D * v0 + im * u * log(S))
+struct ThetaHybrid
+    θ_states::Vector{Float64}
+    β::Vector{Float64}  # [β₁, β₂, β₃, β₄, β₅]
+    γ::Float64
 end
 
 """
-Heston European call price via numerical integration (Heston 1993).
+    OptionContract
 
-C = S·e^{-qT}·P₁ − K·e^{-rT}·P₂
-
-P_j = ½ + (1/π) ∫₀^∞ Re[e^{−iu·ln(K)} · f_j(u) / (iu)] du
-
-f₂(u) = φ(u)           — risk-neutral measure
-f₁(u) = φ(u−i) / φ(−i) — stock-numeraire measure
+Specification of an option contract.
 """
-function heston_call_price(S::Float64, K::Float64, T::Float64, r::Float64,
-                            params::HestonParams; q::Float64=0.0, N_quad::Int=200)::Float64
-    T <= 0.0 && return max(S * exp(-q * T) - K * exp(-r * T), 0.0)
+struct OptionContract
+    K::Float64          # strike price
+    DTE::Int            # days to expiration
+    option_type::Symbol # :call or :put
+    style::Symbol       # :american or :european
+end
 
-    lnK = log(K)
-    du = 150.0 / N_quad
-    φ_neg_i = heston_char_func(ComplexF64(-im), S, K, T, r, q, params)
+# ══════════════════════════════════════════════════════════════════════════════════
+# ψ function and compute_theta (from HestonIV/ThetaFunction.jl)
+# ══════════════════════════════════════════════════════════════════════════════════
 
-    I1, I2 = 0.0, 0.0
-    for i in 1:N_quad
-        u = (i - 0.5) * du
-        u < 1e-8 && continue
+"""
+    ψ(β, DTE, moneyness) → Float64
 
-        e_factor = exp(-im * u * lnK)
+Term-structure, skew, and smile adjustment (Varner 2025 eq. 11):
+    ψ = exp(β₁·ln(τ) + β₂·ln(m) + β₃·ln(τ)·ln(m) + β₄·(ln(m))² + β₅·(ln(τ))²)
 
-        φ_u = heston_char_func(ComplexF64(u), S, K, T, r, q, params)
-        I2 += real(e_factor * φ_u / (im * u)) * du
+where τ = max(DTE, 1) and m = K/S.
 
-        φ_u_mi = heston_char_func(ComplexF64(u) - im, S, K, T, r, q, params)
-        I1 += real(e_factor * φ_u_mi / (im * u * φ_neg_i)) * du
+- β₁: linear DTE decay (negative = short-term IV elevated)
+- β₂: skew (negative = put skew, OTM puts have higher IV)
+- β₃: DTE × skew interaction (positive = skew flattens at longer maturities)
+- β₄: smile curvature
+- β₅: DTE curvature (positive = U-shaped ATM term structure)
+"""
+function ψ(β::Vector{Float64}, DTE::Float64, moneyness::Float64)::Float64
+    log_τ = log(max(DTE, 1.0))
+    log_m = log(moneyness)
+    β₄ = length(β) >= 4 ? β[4] : 0.0
+    β₅ = length(β) >= 5 ? β[5] : 0.0
+    return exp(β[1] * log_τ + β[2] * log_m + β[3] * log_τ * log_m + β₄ * log_m^2 + β₅ * log_τ^2)
+end
+
+"""
+    compute_theta(θ_hybrid, s_t, DTE, moneyness, mood) → Float64
+
+Compute the time-varying mean-reversion target:
+    θ(t) = θ_{s_t} · (1 + γ·M_t) · ψ(DTE, K/S_t)
+
+# Arguments
+- `θ_hybrid::ThetaHybrid`: the hybrid θ-function parameters
+- `s_t::Int`: current HMM state index (1-based)
+- `DTE::Float64`: days to expiration
+- `moneyness::Float64`: K/S_t ratio
+- `mood::Float64`: aggregate market mood ∈ [0, 1]
+"""
+function compute_theta(θ_hybrid::ThetaHybrid, s_t::Int, DTE::Float64,
+                       moneyness::Float64, mood::Float64)::Float64
+    θ_base = θ_hybrid.θ_states[s_t]
+    mood_factor = 1.0 + θ_hybrid.γ * mood
+    ψ_factor = ψ(θ_hybrid.β, DTE, moneyness)
+    return θ_base * mood_factor * ψ_factor
+end
+
+"""
+    compute_mood(states, n_states, n_tail) → Float64
+
+Compute aggregate market mood as the fraction of tickers currently in tail states.
+
+# Arguments
+- `states::Vector{Int}`: current HMM state index for each ticker
+- `n_states::Int`: total number of HMM states
+- `n_tail::Int`: number of states at each tail considered "extreme"
+
+Returns a value in [0, 1] where 0 = no tickers in tail states, 1 = all tickers in tails.
+"""
+function compute_mood(states::Vector{Int}, n_states::Int, n_tail::Int)::Float64
+    n_tickers = length(states)
+    n_tickers == 0 && return 0.0
+    count = 0
+    for s in states
+        if s <= n_tail || s > n_states - n_tail
+            count += 1
+        end
+    end
+    return count / n_tickers
+end
+
+"""
+    compute_mood_path(state_matrix, n_states, n_tail) → Vector{Float64}
+
+Compute market mood at each timestep from a matrix of HMM states.
+
+# Arguments
+- `state_matrix`: n_tickers × n_steps matrix of HMM state indices
+- `n_states::Int`: total number of HMM states
+- `n_tail::Int`: number of tail states at each end
+"""
+function compute_mood_path(state_matrix::Matrix{Int}, n_states::Int, n_tail::Int)::Vector{Float64}
+    n_steps = size(state_matrix, 2)
+    mood = Vector{Float64}(undef, n_steps)
+    for t in 1:n_steps
+        mood[t] = compute_mood(view(state_matrix, :, t), n_states, n_tail)
+    end
+    return mood
+end
+
+"""
+    auto_calibrate_theta_states(model, prices; rf, dt) → Vector{Float64}
+
+Compute θ_states from the empirical variance of returns in each HMM state.
+
+Decodes the historical price series into HMM states using the market model's partition,
+then computes mean(G²) for each state. States with no observations fall back to the
+unconditional variance.
+
+# Arguments
+- `model`: a fitted JumpHiddenMarkovModel (e.g., from fit_jumphmm)
+- `prices::AbstractVector{Float64}`: historical close prices
+
+# Keyword Arguments
+- `rf::Float64`: risk-free rate (default: model.rf)
+- `dt::Float64`: time step in years (default: model.dt)
+
+# Returns
+Vector of length N_states, where θ_states[s] = annualized realized variance when market
+is in state s (suitable for IV = √θ). Converted from growth-rate units via multiplication
+by dt.
+"""
+function auto_calibrate_theta_states(model, prices::AbstractVector{Float64};
+                                     rf::Union{Float64,Nothing}=nothing,
+                                     dt::Union{Float64,Nothing}=nothing)::Vector{Float64}
+    rf_val = rf !== nothing ? rf : model.rf
+    dt_val = dt !== nothing ? dt : model.dt
+
+    G = excess_growth_rates(prices; rf=rf_val, dt=dt_val)
+    states = assign_states(model.partition, G)
+
+    N_states = model.partition.N
+    unconditional_var = sum(G .^ 2) / length(G) * dt_val
+
+    θ_states = Vector{Float64}(undef, N_states)
+    for s in 1:N_states
+        mask = states .== s
+        n_obs = sum(mask)
+        if n_obs > 0
+            θ_states[s] = sum(G[mask] .^ 2) / n_obs * dt_val
+        else
+            θ_states[s] = unconditional_var
+        end
     end
 
-    P1 = clamp(0.5 + I1 / π, 0.0, 1.0)
-    P2 = clamp(0.5 + I2 / π, 0.0, 1.0)
-
-    return max(S * exp(-q * T) * P1 - K * exp(-r * T) * P2, 0.0)
+    return θ_states
 end
 
 """
-Heston European put price via put-call parity.
+    auto_calibrate_heston(price_data, tickers; N, nu, tune_jumps, default_β, default_γ, default_κ, default_σv)
+
+Fit JumpHMM per ticker, auto-calibrate θ_states from realized variance per HMM state,
+decode states for each trading day, and produce a heston_ts dictionary.
+
+This implements the new model's auto-calibration pipeline:
+  1. fit_jumphmm(prices) → HMM model with N states
+  2. auto_calibrate_theta_states(model, prices) → θ per state
+  3. assign_states(partition, G) → decoded state per day
+  4. θ_base[date] = θ_states[state[date]]
+
+Returns Dict{String, Dict{Date, HestonCalibration}} ready for the Wheel engine.
 """
-function heston_put_price(S::Float64, K::Float64, T::Float64, r::Float64,
-                           params::HestonParams; q::Float64=0.0)::Float64
-    call = heston_call_price(S, K, T, r, params; q=q)
-    return call - S * exp(-q * T) + K * exp(-r * T)
+function auto_calibrate_heston(price_data::Dict{String, DataFrame},
+                                tickers::Vector{String};
+                                N::Int=100, nu::Float64=5.0,
+                                tune_jumps::Bool=false,
+                                default_β::Vector{Float64}=Float64[0.0, 0.0, 0.0, 0.0, 0.0],
+                                default_γ::Float64=0.0,
+                                default_κ::Float64=5.0,
+                                default_σv::Float64=0.3)::Dict{String, Dict{Date, HestonCalibration}}
+    heston_ts = Dict{String, Dict{Date, HestonCalibration}}()
+
+    for tk in tickers
+        !haskey(price_data, tk) && continue
+        df = price_data[tk]
+        nrow(df) < 61 && continue
+
+        try
+            prices = Float64.(df.adj_close)
+            model = fit_jumphmm(prices; N=N, nu=nu)
+            if tune_jumps
+                model = tune_jumphmm(model, prices)
+            end
+
+            θ_states = auto_calibrate_theta_states(model, prices)
+
+            G = excess_growth_rates(prices; rf=model.rf, dt=model.dt)
+            decoded_states = assign_states(model.partition, G)
+
+            tk_cal = Dict{Date, HestonCalibration}()
+            dates = df.date
+            for i in 1:length(decoded_states)
+                d = dates[i + 1]
+                s = decoded_states[i]
+                θ_base = θ_states[s]
+                β5_val = length(default_β) >= 5 ? default_β[5] : 0.0
+                tk_cal[d] = HestonCalibration(θ_base, default_β[1], default_β[2],
+                                               default_β[3], default_β[4], β5_val,
+                                               default_γ, default_κ, default_σv)
+            end
+            heston_ts[tk] = tk_cal
+            println("    $tk: $(length(tk_cal)) dates, θ range [$(round(minimum(θ_states), digits=4)), $(round(maximum(θ_states), digits=4))], IV range [$(round(sqrt(minimum(θ_states))*100, digits=1))%, $(round(sqrt(maximum(θ_states))*100, digits=1))%]")
+        catch e
+            @warn "Auto-calibration failed for $tk: $e"
+        end
+    end
+
+    println("  -> Auto-calibrated Heston: $(length(heston_ts)) tickers")
+    return heston_ts
+end
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Heston Variance Process (from HestonIV/HestonVariance.jl)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+"""
+    simulate_variance(params, θ_func, hmm_states, S_path, contract, mood_path; Δt, rng) → Vector{Float64}
+
+Simulate the modified Heston variance process along a single JumpHMM price path.
+
+The initial variance v₀ is set to θ(t=0) — the mean-reversion target at the
+first timestep — so each (ticker, strike, DTE) triple starts at its own
+equilibrium IV. This gives the initial IV surface smile, skew, and term
+structure automatically.
+
+The variance process is discretized via Euler-Maruyama with a reflecting boundary:
+    v_{t+1} = |v_t + κ(θ_t - v_t)Δt + σ_v·√(max(v_t,0))·√Δt·Z|
+
+# Arguments
+- `params::HestonParameters`: κ, σ_v
+- `θ_func::ThetaHybrid`: hybrid θ-function parameters
+- `hmm_states::Vector{Int}`: HMM state sequence from JumpHMM simulation
+- `S_path::Vector{Float64}`: underlying price path
+- `contract::OptionContract`: option contract (provides K and DTE)
+- `mood_path::Vector{Float64}`: market mood at each timestep
+- `Δt::Float64`: time step in years (default 1/252)
+- `rng`: random number generator
+
+# Returns
+Vector of variance values v_t at each timestep. Take √v_t to get implied volatility.
+"""
+function simulate_variance(params::HestonParameters, θ_func::ThetaHybrid,
+                           hmm_states::Vector{Int}, S_path::Vector{Float64},
+                           contract::OptionContract, mood_path::Vector{Float64};
+                           Δt::Float64=1.0/252.0,
+                           rng::AbstractRNG=Random.default_rng())::Vector{Float64}
+    n_steps = length(hmm_states)
+    v = Vector{Float64}(undef, n_steps)
+
+    remaining_DTE_0 = Float64(contract.DTE)
+    moneyness_0 = contract.K / S_path[1]
+    v[1] = compute_theta(θ_func, hmm_states[1], remaining_DTE_0,
+                         moneyness_0, mood_path[1])
+
+    sqrt_Δt = sqrt(Δt)
+
+    for t in 1:(n_steps - 1)
+        remaining_DTE = max(contract.DTE - t + 1, 1)
+        moneyness = contract.K / S_path[t]
+
+        θ_t = compute_theta(θ_func, hmm_states[t], Float64(remaining_DTE),
+                            moneyness, mood_path[t])
+
+        v_curr = max(v[t], 0.0)
+        dv = params.κ * (θ_t - v_curr) * Δt + params.σ_v * sqrt(v_curr) * sqrt_Δt * randn(rng)
+        v[t + 1] = abs(v_curr + dv)
+    end
+
+    return v
 end
 
 """
-Convert a Heston model price to Black-Scholes implied volatility via bisection.
-"""
-function heston_implied_vol(S::Float64, K::Float64, T::Float64, r::Float64,
-                             params::HestonParams; q::Float64=0.0,
-                             option_type::Symbol=:put)::Float64
-    T <= 0.0 && return sqrt(params.v0)
+    simulate_variance_ensemble(params, θ_func, hmm_states_matrix, S_paths_matrix,
+                                contract, mood_path; n_var_paths, Δt, rng) → Matrix{Float64}
 
-    target = option_type == :call ?
-        heston_call_price(S, K, T, r, params; q=q) :
-        heston_put_price(S, K, T, r, params; q=q)
-    target <= 0.0 && return sqrt(params.v0)
+Simulate multiple variance paths for each synthetic price path.
+
+For scenario analysis, each JumpHMM price path can generate multiple variance
+realizations (since dW_v is independent of the price path noise).
+
+# Arguments
+- `hmm_states_matrix`: n_paths × n_steps matrix of HMM states
+- `S_paths_matrix`: n_paths × n_steps matrix of underlying prices
+- `mood_path`: n_steps vector of market mood (shared across paths for a given simulation)
+- `n_var_paths::Int`: number of variance paths per price path
+
+# Returns
+(n_paths * n_var_paths) × n_steps matrix of variance values.
+"""
+function simulate_variance_ensemble(params::HestonParameters, θ_func::ThetaHybrid,
+                                    hmm_states_matrix::Matrix{Int},
+                                    S_paths_matrix::Matrix{Float64},
+                                    contract::OptionContract,
+                                    mood_path::Vector{Float64};
+                                    n_var_paths::Int=1,
+                                    Δt::Float64=1.0/252.0,
+                                    rng::AbstractRNG=Random.default_rng())::Matrix{Float64}
+    n_price_paths, n_steps = size(S_paths_matrix)
+    total_paths = n_price_paths * n_var_paths
+    V = Matrix{Float64}(undef, total_paths, n_steps)
+
+    idx = 1
+    for i in 1:n_price_paths
+        states_i = view(hmm_states_matrix, i, :) |> collect
+        S_i = view(S_paths_matrix, i, :) |> collect
+        for _ in 1:n_var_paths
+            V[idx, :] .= simulate_variance(params, θ_func, states_i, S_i,
+                                           contract, mood_path; Δt=Δt, rng=rng)
+            idx += 1
+        end
+    end
+
+    return V
+end
+
+"""Convert variance to implied volatility: σ_imp = √v."""
+variance_to_iv(v::Float64)::Float64 = sqrt(max(v, 0.0))
+
+"""Convert a variance path to an IV path."""
+variance_path_to_iv(v_path::Vector{Float64})::Vector{Float64} = [variance_to_iv(v) for v in v_path]
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Calibration (from HestonIV/Calibration.jl)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+"""
+    CalibrationData
+
+Preprocessed calibration dataset: one row per (date, strike, DTE) observation.
+"""
+struct CalibrationData
+    dates::Vector{Int}           # timestep index into the price series
+    strikes::Vector{Float64}     # strike prices
+    dtes::Vector{Int}            # days to expiration
+    market_ivs::Vector{Float64}  # observed implied volatilities
+    spot_prices::Vector{Float64} # underlying price at each observation
+    hmm_states::Vector{Int}      # decoded HMM state at each observation
+    moods::Vector{Float64}       # market mood at each observation
+end
+
+"""
+    calibrate(cal_data, N_states; kwargs...) → (HestonParameters, ThetaHybrid)
+
+Calibrate the Heston + ThetaHybrid parameters to minimize IV prediction error.
+
+Since v₀ = θ(t=0) (the process starts at equilibrium), the calibration objective
+simplifies: the model-predicted IV for each observation is just √θ(s, DTE, K/S, M).
+The κ parameter controls how quickly the process would mean-revert if perturbed,
+and σ_v controls the stochastic spread around the target.
+
+# Arguments
+- `cal_data::CalibrationData`: preprocessed calibration data
+- `N_states::Int`: number of HMM states
+
+# Keyword Arguments
+- `κ_init::Float64`: initial κ (default 5.0)
+- `σv_init::Float64`: initial σ_v (default 0.3)
+- `γ_init::Float64`: initial mood sensitivity (default 0.5)
+- `method`: Optim method (default NelderMead())
+- `maxiter::Int`: maximum iterations (default 5000)
+
+# Returns
+Tuple of (HestonParameters, ThetaHybrid) that minimize Σ(σ_model - IV_market)²
+"""
+function calibrate(cal_data::CalibrationData, N_states::Int;
+                   κ_init::Float64=5.0,
+                   σv_init::Float64=0.3,
+                   γ_init::Float64=0.5,
+                   method=NelderMead(),
+                   maxiter::Int=5000)
+
+    n_obs = length(cal_data.market_ivs)
+
+    # Parameter vector layout (Varner 2025 eq. 11):
+    # [1:5]       = β₁, β₂, β₃, β₄, β₅ (ψ parameters)
+    # [6:5+N]     = log(θ_states)   (ensures θ > 0 for each state)
+    # κ, σ_v, γ are fixed (not optimized — κ/σ_v are unidentifiable from √θ)
+
+    θ_init = fill(0.04, N_states)
+    for i in 1:n_obs
+        s = cal_data.hmm_states[i]
+        if 1 <= s <= N_states
+            θ_init[s] = cal_data.market_ivs[i]^2
+        end
+    end
+
+    n_params = 5 + N_states
+    x0 = Vector{Float64}(undef, n_params)
+    x0[1] = 0.0   # β₁ (DTE decay)
+    x0[2] = 0.0   # β₂ (skew)
+    x0[3] = 0.0   # β₃ (interaction)
+    x0[4] = 0.0   # β₄ (smile curvature)
+    x0[5] = 0.0   # β₅ (DTE curvature)
+    x0[6:end] .= log.(max.(θ_init, 1e-8))
+
+    function objective(x)
+        β = x[1:5]
+        θ_states = exp.(x[6:end])
+        γ = γ_init
+
+        θ_func = ThetaHybrid(θ_states, β, γ)
+
+        total_error = 0.0
+        for i in 1:n_obs
+            s = cal_data.hmm_states[i]
+            if s < 1 || s > N_states
+                continue
+            end
+            DTE = Float64(cal_data.dtes[i])
+            moneyness = cal_data.strikes[i] / cal_data.spot_prices[i]
+            mood = cal_data.moods[i]
+
+            θ_t = compute_theta(θ_func, s, DTE, moneyness, mood)
+            σ_model = sqrt(max(θ_t, 1e-10))
+
+            total_error += (σ_model - cal_data.market_ivs[i])^2
+        end
+
+        # Soft bounds on β to prevent extreme parameters (per paper Table 4)
+        penalty = 0.0
+        penalty += max(0.0, abs(β[1]) - 1.0)^2 * 10.0
+        penalty += max(0.0, abs(β[2]) - 12.0)^2 * 10.0
+        penalty += max(0.0, β[3] < 0.0 ? -β[3] : 0.0)^2 * 10.0  # β₃ ≥ 0
+        penalty += max(0.0, abs(β[4]) - 3.0)^2 * 10.0
+        penalty += max(0.0, abs(β[5]) - 0.5)^2 * 10.0
+
+        return total_error / n_obs + penalty
+    end
+
+    result = optimize(objective, x0, method,
+                      Optim.Options(iterations=maxiter, show_trace=false))
+
+    x_opt = Optim.minimizer(result)
+
+    heston = HestonParameters(κ_init, σv_init)
+    θ_func = ThetaHybrid(exp.(x_opt[6:end]), x_opt[1:5], γ_init)
+
+    return heston, θ_func
+end
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# Wheel Integration Layer
+# ══════════════════════════════════════════════════════════════════════════════════
+
+"""
+    HestonParams
+
+Runtime parameters for the Wheel engine, combining ThetaHybrid + HestonParameters
+into a single struct for convenience. Single-state: θ_base = θ_states[1], hmm_state=1.
+
+- `θ_base`: base variance level (= θ_states[1] for single-state calibration)
+- `β`: [β₁, β₂, β₃, β₄] — ψ shape parameters
+- `γ`: mood/regime sensitivity
+- `κ`: mean-reversion speed of variance process
+- `σ_v`: vol-of-vol
+- `mood`: current market mood ∈ [0,1], default 0.0
+"""
+struct HestonParams
+    θ_base::Float64
+    β::Vector{Float64}
+    γ::Float64
+    κ::Float64
+    σ_v::Float64
+    mood::Float64
+end
+
+"""
+    HestonCalibration
+
+Stored calibration result per (ticker, date).
+Flat fields for CSV serialization.
+"""
+struct HestonCalibration
+    θ_base::Float64
+    β1::Float64
+    β2::Float64
+    β3::Float64
+    β4::Float64
+    β5::Float64
+    γ::Float64
+    κ::Float64
+    σ_v::Float64
+end
+
+const HESTON_CAL_PATH = joinpath(_PATH_TO_DATA, "heston_params.csv")
+
+# ── IV Computation ────────────────────────────────────────────────────────────
+
+"""
+    heston_iv_for_option(S, K, T, r, params; q, option_type) → Float64
+
+Compute per-contract implied volatility using the modified Heston model.
+Internally constructs ThetaHybrid and delegates to compute_theta:
+
+    IV = √(compute_theta(ThetaHybrid([θ_base], β, γ), 1, DTE, K/S, mood))
+
+This gives each (K, DTE) pair its own IV automatically, producing
+the volatility smile, skew, and term structure from the ψ function.
+"""
+function heston_iv_for_option(S::Float64, K::Float64, T::Float64, r::Float64,
+                               params::HestonParams;
+                               q::Float64=0.0, option_type::Symbol=:put)::Float64
+    DTE = max(T * 365.0, 1.0)
+    moneyness = K / S
+    θ_func = ThetaHybrid([params.θ_base], params.β, params.γ)
+    θ_t = compute_theta(θ_func, 1, DTE, moneyness, params.mood)
+    return sqrt(max(θ_t, 1e-10))
+end
+
+# ── Heston Variance Process (Wheel wrapper) ──────────────────────────────────
+
+"""
+    simulate_heston_variance(params, hmm_states, S_path, K, DTE, mood_path; ...) → Vector{Float64}
+
+Wrapper around simulate_variance (from new code) for the Wheel engine's flat HestonParams.
+Constructs HestonParameters, ThetaHybrid, OptionContract internally.
+"""
+function simulate_heston_variance(params::HestonParams,
+                                   hmm_states::Vector{Int},
+                                   S_path::Vector{Float64},
+                                   K::Float64, DTE::Int,
+                                   mood_path::Vector{Float64};
+                                   Δt::Float64=1.0/252.0,
+                                   rng::AbstractRNG=Random.default_rng())::Vector{Float64}
+    heston = HestonParameters(params.κ, params.σ_v)
+    θ_func = ThetaHybrid([params.θ_base], params.β, params.γ)
+    contract = OptionContract(K, DTE, :put, :american)
+    return simulate_variance(heston, θ_func, hmm_states, S_path, contract, mood_path;
+                             Δt=Δt, rng=rng)
+end
+
+# ── Calibration (Nelder-Mead, matching new code's approach) ──────────────────
+
+"""
+    calibrate_heston_from_options(S, r, option_data; q) → HestonParams
+
+Calibrate from market option prices: extract BS IVs, then fit via Nelder-Mead.
+"""
+function calibrate_heston_from_options(S::Float64, r::Float64,
+                                        option_data::Vector;
+                                        q::Float64=0.0)::HestonParams
+    length(option_data) < 3 && error("Need ≥3 option observations, got $(length(option_data))")
+
+    market_ivs = Float64[]
+    strikes = Float64[]
+    dtes = Float64[]
+    for opt in option_data
+        T = opt.T
+        K = opt.K
+        iv = _extract_bs_iv(S, K, T, r, opt.market_price, opt.option_type; q=q)
+        if iv > 0.001 && iv < 3.0
+            push!(market_ivs, iv)
+            push!(strikes, K)
+            push!(dtes, max(T * 365.0, 1.0))
+        end
+    end
+
+    length(market_ivs) < 3 && error("Need ≥3 valid IV observations after extraction")
+
+    return calibrate_heston_nelder_mead(market_ivs, strikes, dtes, S)
+end
+
+"""
+    calibrate_heston_nelder_mead(market_ivs, strikes, dtes, S; mood) → HestonParams
+
+Calibrate θ_base, β₁..β₄, γ, κ, σ_v by minimizing Σ(√(compute_theta(...)) - IV_market)²
+using Nelder-Mead. Matches the new code's calibrate() for single-state (N_states=1).
+"""
+function calibrate_heston_nelder_mead(market_ivs::Vector{Float64},
+                                       strikes::Vector{Float64},
+                                       dtes::Vector{Float64},
+                                       S::Float64;
+                                       mood::Float64=0.0)::HestonParams
+    moneyness = strikes ./ S
+    n_obs = length(market_ivs)
+    mean_iv2 = mean(market_ivs .^ 2)
+
+    # Parameter vector: [log(θ_base), β₁, β₂, β₃, β₄, β₅]
+    # κ, σ_v, γ are fixed (not identifiable from √θ)
+    x0 = [log(max(mean_iv2, 1e-8)), 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    function objective(x)
+        θ_base = exp(x[1])
+        β = x[2:6]
+        θ_func = ThetaHybrid([θ_base], β, mood)
+        total = 0.0
+        for i in 1:n_obs
+            θ_t = compute_theta(θ_func, 1, dtes[i], moneyness[i], mood)
+            σ_model = sqrt(max(θ_t, 1e-10))
+            total += (σ_model - market_ivs[i])^2
+        end
+        return total / n_obs
+    end
+
+    result = optimize(objective, x0, NelderMead(),
+                      Optim.Options(iterations=5000, show_trace=false))
+    x_opt = Optim.minimizer(result)
+
+    return HestonParams(exp(x_opt[1]), x_opt[2:6], 0.0, 5.0, 0.3, mood)
+end
+
+"""Extract Black-Scholes implied volatility from a market price via bisection."""
+function _extract_bs_iv(S::Float64, K::Float64, T::Float64, r::Float64,
+                         market_price::Float64, option_type::Symbol;
+                         q::Float64=0.0)::Float64
+    T <= 0.0 && return 0.0
+    market_price <= 0.0 && return 0.0
 
     σ_lo, σ_hi = 0.001, 5.0
     for _ in 1:80
         σ_mid = (σ_lo + σ_hi) / 2.0
         bs_price = _bs_price(S, K, T, r, σ_mid, option_type; q=q)
-        if bs_price > target
+        if bs_price > market_price
             σ_hi = σ_mid
         else
             σ_lo = σ_mid
@@ -139,98 +700,34 @@ function _bs_price(S::Float64, K::Float64, T::Float64, r::Float64, σ::Float64,
     end
 end
 
-# ── Calibration ──────────────────────────────────────────────────────────────
+# ── Load / Lookup ─────────────────────────────────────────────────────────────
 
 """
-    HestonCalibration
+    load_heston_params(path) → Dict{String, Dict{Date, HestonCalibration}}
 
-Per-ticker, per-date Heston parameters calibrated from real market option data.
-All five parameters (v₀, κ, θ, ξ, ρ) come directly from fitting to option prices.
-No hardcoded defaults, no VRP.
-"""
-struct HestonCalibration
-    v0::Float64
-    kappa::Float64
-    theta::Float64
-    xi::Float64
-    rho::Float64
-end
-
-const HESTON_CAL_PATH = joinpath(_PATH_TO_DATA, "heston_params.csv")
-
-"""
-    calibrate_heston_from_options(S, r, option_data; q) -> HestonParams
-
-Calibrate all 5 Heston parameters by minimizing SSE between Heston model
-prices and real market mid-prices via grid search.
-
-Input: a set of (K, T, market_price, option_type) observations from a single day.
-"""
-function calibrate_heston_from_options(S::Float64, r::Float64,
-                                        option_data::Vector;
-                                        q::Float64=0.0)::HestonParams
-    length(option_data) < 3 && error("Need ≥3 option observations, got $(length(option_data))")
-
-    atm_opts = filter(o -> abs(o.K - S) / S < 0.05, option_data)
-    v0_est = if !isempty(atm_opts)
-        avg_mid = mean(o.market_price for o in atm_opts)
-        avg_T = mean(o.T for o in atm_opts)
-        max((avg_mid / S / 0.4)^2 / max(avg_T, 0.01), 0.005^2)
-    else
-        (0.25)^2
-    end
-    v0_est = clamp(v0_est, 0.005^2, 2.0^2)
-
-    best_params = HestonParams(v0_est, 2.0, v0_est, 0.5, -0.7)
-    best_error = Inf
-
-    v0_grid  = [v0_est * f for f in [0.5, 0.75, 1.0, 1.5, 2.0]]
-    kap_grid = [0.5, 1.0, 2.0, 4.0, 8.0]
-    tht_grid = [v0_est * f for f in [0.5, 1.0, 1.5]]
-    xi_grid  = [0.2, 0.5, 0.8]
-    rho_grid = [-0.9, -0.7, -0.5, -0.3]
-
-    for v0 in v0_grid, kap in kap_grid, tht in tht_grid, xi in xi_grid, rho in rho_grid
-        params = HestonParams(v0, kap, tht, xi, rho)
-        total_err = 0.0
-        valid = true
-        for opt in option_data
-            try
-                model_price = opt.option_type == :call ?
-                    heston_call_price(S, opt.K, opt.T, r, params; q=q) :
-                    heston_put_price(S, opt.K, opt.T, r, params; q=q)
-                total_err += (model_price - opt.market_price)^2
-            catch
-                valid = false; break
-            end
-        end
-        if valid && total_err < best_error
-            best_error = total_err
-            best_params = params
-        end
-    end
-
-    return best_params
-end
-
-"""
-    load_heston_params(path) -> Dict{String, Dict{Date, HestonCalibration}}
-
-Load rolling Heston calibration time-series produced by `calibrate_heston.jl`.
-Returns: ticker → (date → HestonCalibration)
+Load Heston calibration time-series from CSV.
+Expected columns: ticker, date, theta_base, beta1..beta5, gamma, kappa, sigma_v
 """
 function load_heston_params(path::String)::Dict{String, Dict{Date, HestonCalibration}}
     df = CSV.read(path, DataFrame)
     result = Dict{String, Dict{Date, HestonCalibration}}()
+
+    has_β5 = hasproperty(df, :beta5)
+
     for row in eachrow(df)
         tk = row.ticker
         d = Date(row.date)
-        cal = HestonCalibration(row.v0, row.kappa, row.theta, row.xi, row.rho)
+
+        β5_val = has_β5 ? row.beta5 : 0.0
+        cal = HestonCalibration(row.theta_base, row.beta1, row.beta2, row.beta3, row.beta4,
+                                 β5_val, row.gamma, row.kappa, row.sigma_v)
+
         if !haskey(result, tk)
             result[tk] = Dict{Date, HestonCalibration}()
         end
         result[tk][d] = cal
     end
+
     n_tickers = length(result)
     n_dates = isempty(result) ? 0 : maximum(length(v) for v in values(result))
     println("  -> Loaded Heston params: $(n_tickers) tickers × up to $(n_dates) calibration dates")
@@ -238,9 +735,10 @@ function load_heston_params(path::String)::Dict{String, Dict{Date, HestonCalibra
 end
 
 """
-    lookup_heston_params(heston_ts, ticker, date) -> HestonParams
+    lookup_heston_params(heston_ts, ticker, date) → Union{HestonParams, Nothing}
 
 Find the most recent calibration on or before `date` for `ticker`.
+Returns a ready-to-use HestonParams with mood=0.0.
 """
 function lookup_heston_params(heston_ts::Dict{String, Dict{Date, HestonCalibration}},
                                 ticker::String, date::Date)::Union{HestonParams, Nothing}
@@ -250,57 +748,17 @@ function lookup_heston_params(heston_ts::Dict{String, Dict{Date, HestonCalibrati
     idx = searchsortedlast(cal_dates, date)
     idx == 0 && return nothing
     cal = heston_ts[ticker][cal_dates[idx]]
-    return HestonParams(cal.v0, cal.kappa, cal.theta, cal.xi, cal.rho)
+    return HestonParams(cal.θ_base, [cal.β1, cal.β2, cal.β3, cal.β4, cal.β5],
+                         cal.γ, cal.κ, cal.σ_v, 0.0)
 end
 
-# ── IV Surface Generation ────────────────────────────────────────────────────
+# ── Regime Adjustment ─────────────────────────────────────────────────────────
 
 """
-    generate_iv_surface(S, r, params; tenors, deltas, q) -> DataFrame
+    compute_stock_rv_regime(rolling_vol) → Dict{String, Dict{Date, Float64}}
 
-Generate a full IV surface for a given stock price and Heston parameters.
-Produces IV for every combination of tenor and delta.
-"""
-function generate_iv_surface(S::Float64, r::Float64, params::HestonParams;
-                              tenors::Vector{Int}=[7, 14, 30, 60, 90],
-                              deltas::Vector{Float64}=[0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50],
-                              q::Float64=0.0)::DataFrame
-    rows = NamedTuple{(:tenor_days, :delta, :strike, :iv_put, :iv_call, :put_price, :call_price),
-                       Tuple{Int, Float64, Float64, Float64, Float64, Float64, Float64}}[]
-
-    for tenor in tenors
-        T = tenor / 365.0
-        for δ in deltas
-            K = strike_from_delta(S, T, r, sqrt(params.v0), δ, :put; q=q)
-            iv_p = heston_implied_vol(S, K, T, r, params; q=q, option_type=:put)
-            iv_c = heston_implied_vol(S, K, T, r, params; q=q, option_type=:call)
-            p_price = heston_put_price(S, K, T, r, params; q=q)
-            c_price = heston_call_price(S, K, T, r, params; q=q)
-            push!(rows, (tenor_days=tenor, delta=δ, strike=round(K, digits=2),
-                         iv_put=round(iv_p, digits=4), iv_call=round(iv_c, digits=4),
-                         put_price=round(p_price, digits=2), call_price=round(c_price, digits=2)))
-        end
-    end
-
-    return DataFrame(rows)
-end
-
-"""
-    compute_stock_rv_regime(rolling_vol) -> Dict{String, Dict{Date, Float64}}
-
-Compute a per-stock daily regime multiplier from each ticker's own rolling
-realized volatility.
-
-For each (ticker, date):
-  regime = σ_rv(date) / expanding_median(σ_rv, start..date)
-  clamped to [0.5, 2.0]
-
-  regime > 1.0 → stock is more volatile than its own historical norm → scale v₀ up
-  regime < 1.0 → stock is calmer than usual → scale v₀ down
-  regime ≈ 1.0 → normal conditions for this stock
-
-Unlike VIX-based regime, this is stock-specific: NVDA and KO each get
-their own regime based on their own volatility history.
+Compute a per-stock daily regime multiplier:
+    regime = σ_rv(date) / expanding_median(σ_rv) ∈ [0.5, 2.0]
 """
 function compute_stock_rv_regime(rolling_vol::Dict{String, Dict{Date, Float64}})::Dict{String, Dict{Date, Float64}}
     result = Dict{String, Dict{Date, Float64}}()
@@ -323,26 +781,64 @@ function compute_stock_rv_regime(rolling_vol::Dict{String, Dict{Date, Float64}})
 end
 
 """
-    rv_adjusted_params(params, regime_scale) -> HestonParams
+    rv_adjusted_params(params, regime_scale) → HestonParams
 
-Return a copy of `params` with v₀ scaled by the per-stock RV regime multiplier.
-κ, θ, ξ, ρ remain unchanged (slow-moving, from periodic calibration).
+Scale θ_base by the per-stock RV regime multiplier.
+regime > 1.0 → stock more volatile than its norm → higher IV
+regime < 1.0 → stock calmer than usual → lower IV
 """
 function rv_adjusted_params(params::HestonParams, regime_scale::Float64)::HestonParams
-    return HestonParams(params.v0 * regime_scale, params.kappa, params.theta, params.xi, params.rho)
+    return HestonParams(params.θ_base * regime_scale, params.β, params.γ,
+                         params.κ, params.σ_v, params.mood)
 end
 
 """
-    build_heston_iv_map(price_data, trading_days;
-                         r, heston_ts, rolling_vol) -> Dict{String, Dict{Date, Float64}}
+    vix_adjusted_params(params, regime_scale) → HestonParams
 
-Build rolling IV map using pre-calibrated Heston parameters from
-`calibrate_heston.jl`, with v₀ daily-adjusted by each stock's own
-realized volatility regime.
+Alias for rv_adjusted_params — scales θ_base by a market-wide regime factor.
+"""
+function vix_adjusted_params(params::HestonParams, regime_scale::Float64)::HestonParams
+    return rv_adjusted_params(params, regime_scale)
+end
 
-κ, θ, ξ, ρ come from `heston_params.csv` (calibrated every N trading days).
-v₀ is scaled each day by the per-stock RV regime:
-    v₀_live = v₀_calibrated × rv_regime(ticker, date)
+# ── IV Surface & Map ──────────────────────────────────────────────────────────
+
+"""
+    generate_iv_surface(S, r, params; tenors, deltas, q) → DataFrame
+
+Generate a full IV surface for a given stock price and Heston parameters.
+"""
+function generate_iv_surface(S::Float64, r::Float64, params::HestonParams;
+                              tenors::Vector{Int}=[7, 14, 30, 60, 90],
+                              deltas::Vector{Float64}=[0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50],
+                              q::Float64=0.0)::DataFrame
+    rows = NamedTuple{(:tenor_days, :delta, :strike, :iv_put, :iv_call, :put_price, :call_price),
+                       Tuple{Int, Float64, Float64, Float64, Float64, Float64, Float64}}[]
+
+    atm_iv = heston_iv_for_option(S, S, 30.0/365.0, r, params)
+
+    for tenor in tenors
+        T = tenor / 365.0
+        for δ in deltas
+            K = strike_from_delta(S, T, r, atm_iv, δ, :put; q=q)
+            iv_p = heston_iv_for_option(S, K, T, r, params; q=q, option_type=:put)
+            iv_c = heston_iv_for_option(S, K, T, r, params; q=q, option_type=:call)
+            p_price = option_price(S, K, T, r, iv_p, :put; q=q)
+            c_price = option_price(S, K, T, r, iv_c, :call; q=q)
+            push!(rows, (tenor_days=tenor, delta=δ, strike=round(K, digits=2),
+                         iv_put=round(iv_p, digits=4), iv_call=round(iv_c, digits=4),
+                         put_price=round(p_price, digits=2), call_price=round(c_price, digits=2)))
+        end
+    end
+
+    return DataFrame(rows)
+end
+
+"""
+    build_heston_iv_map(price_data, trading_days; r, heston_ts, rolling_vol) → Dict
+
+Build rolling ATM IV map using pre-calibrated modified Heston parameters,
+with θ_base daily-adjusted by each stock's own RV regime.
 """
 function build_heston_iv_map(price_data::Dict{String, DataFrame},
                                trading_days::Vector{Date};
@@ -377,9 +873,10 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
 
             S = get_price_on_date(tk_df, d)
             if S !== nothing && S > 0.0
-                iv_dict[d] = heston_implied_vol(Float64(S), Float64(S), 30.0/365.0, r, adjusted; option_type=:put)
+                iv_dict[d] = heston_iv_for_option(Float64(S), Float64(S),
+                                                   30.0/365.0, r, adjusted; option_type=:put)
             else
-                iv_dict[d] = sqrt(adjusted.v0)
+                iv_dict[d] = sqrt(max(adjusted.θ_base, 0.0))
             end
         end
 
@@ -394,20 +891,7 @@ function build_heston_iv_map(price_data::Dict{String, DataFrame},
         missing_tks = [tk for tk in keys(price_data) if !haskey(result, tk)]
         @warn "Tickers without Heston calibration (no IV generated): $missing_tks"
     end
-    rv_status = isempty(rv_regime) ? "no RV adjustment" : "per-stock RV-adjusted v₀"
+    rv_status = isempty(rv_regime) ? "no RV adjustment" : "per-stock RV-adjusted θ_base"
     println("  Heston IV map: $(n_done)/$(n_total) tickers ($(rv_status))")
     return result
-end
-
-"""
-    heston_iv_for_option(S, K, T, r, params; q, option_type) -> Float64
-
-Single-point IV query: given current market state and Heston params,
-return the BS-equivalent IV for a specific option contract.
-This is used by WheelEngine for pricing individual option positions.
-"""
-function heston_iv_for_option(S::Float64, K::Float64, T::Float64, r::Float64,
-                               params::HestonParams;
-                               q::Float64=0.0, option_type::Symbol=:put)::Float64
-    return heston_implied_vol(S, K, T, r, params; q=q, option_type=option_type)
 end

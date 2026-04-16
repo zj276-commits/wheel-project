@@ -850,13 +850,15 @@ const EXTENDED_STRESS_SCENARIOS = [
 # ── Heston-Aware Regime GBM ──────────────────────────────────────────────────
 
 """
-    simulate_heston_regime_gbm(S₀, hmm, heston_params, T; Δt, n_paths)
+    simulate_heston_regime_gbm(S₀, regime_params, heston_params, T; Δt, n_paths)
 
 Regime-switching GBM where volatility comes from:
   1. HMM regime state (bull/bear/sideways) → selects σ regime
-  2. Heston stochastic vol provides the per-step variance adjustment
+  2. Modified Heston variance process provides per-step variance adjustment
 
-This combines the HMM regime detection with the Heston vol dynamics.
+Uses the modified Heston model:
+    dv = κ(θ_base - v)dt + σ_v √v dW_v
+with reflecting boundary, and v₀ = θ_base (start at equilibrium).
 """
 function simulate_heston_regime_gbm(S0::Float64,
                                       regime_params::NamedTuple,
@@ -868,33 +870,30 @@ function simulate_heston_regime_gbm(S0::Float64,
     paths = Matrix{Float64}(undef, n_steps + 1, n_paths)
     paths[1, :] .= S0
 
-    kap = heston_params.kappa
-    tht = heston_params.theta
-    xi_h = heston_params.xi
-    rho_h = heston_params.rho
+    κ = heston_params.κ
+    θ_target = heston_params.θ_base
+    σ_v = heston_params.σ_v
     p_ts = regime_params.p_to_stressed
     p_tn = regime_params.p_to_normal
 
     for p in 1:n_paths
         stressed = false
-        v = heston_params.v0
+        v = θ_target
 
         for t in 2:(n_steps + 1)
             stressed = stressed ? (rand() > p_tn) : (rand() < p_ts)
             mu_t = stressed ? regime_params.mu_stressed : regime_params.mu_normal
             sig_regime = stressed ? regime_params.sig_stressed : regime_params.sig_normal
 
-            Z1, Z2 = randn(), randn()
-            Zv = rho_h * Z1 + sqrt(1 - rho_h^2) * Z2
-
-            v_next = v + kap * (tht - v) * Δt + xi_h * sqrt(max(v, 0.0) * Δt) * Zv
+            Zv = randn()
+            v_next = v + κ * (θ_target - v) * Δt + σ_v * sqrt(max(v, 0.0) * Δt) * Zv
             v = max(v_next, 1e-8)
 
             sig_eff = 0.5 * sig_regime + 0.5 * sqrt(v)
 
             drift = (mu_t - 0.5 * sig_eff^2) * Δt
             diffusion = sig_eff * sqrt(Δt)
-            paths[t, p] = paths[t-1, p] * exp(drift + diffusion * Z1)
+            paths[t, p] = paths[t-1, p] * exp(drift + diffusion * randn())
         end
     end
     return paths

@@ -30,6 +30,7 @@ using PrettyTables
 using StatsBase
 using HTTP
 using JSON3
+using Optim
 
 # ── Source modules (dependency order) ─────────────────────────────────────────
 

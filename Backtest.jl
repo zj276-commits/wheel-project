@@ -231,12 +231,13 @@ if isfile(HESTON_CAL_PATH)
         @warn "Tickers without Heston calibration: $missing_cal"
     end
 else
-    @warn "heston_params.csv not found — Heston IV will be unavailable. Run `julia calibrate_heston.jl` to generate it."
+    println("  heston_params.csv not found — auto-calibrating from JumpHMM + price data...")
+    heston_ts = auto_calibrate_heston(price_data, all_tickers; N=5, nu=5.0, tune_jumps=false)
 end
 
 # ── 2g: Implied volatility — Heston stochastic volatility model ───────────
 
-println("  Building Heston IV map (per-stock RV-adjusted v₀)...")
+println("  Building Heston IV map (per-stock RV-adjusted θ_base)...")
 rv_regime_map = compute_stock_rv_regime(rolling_vol)
 rolling_iv = build_heston_iv_map(price_data, trading_days;
                                    r=0.045, heston_ts=heston_ts, rolling_vol=rolling_vol)
